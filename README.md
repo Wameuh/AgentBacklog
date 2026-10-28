@@ -73,6 +73,11 @@ Schema: one `features` table (`id`, `title`, `description`,
 `started_at`, `done_at`). The `priority` column is added automatically to
 older databases.
 
+## Contributing
+
+`main` is protected — contributions go through pull requests from a fork.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
