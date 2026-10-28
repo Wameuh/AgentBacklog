@@ -16,7 +16,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS features (
     description TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'wip', 'done')),
+    priority    INTEGER NOT NULL DEFAULT 0,
     agent_id    TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at  TEXT,
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS features (
 """
 
 LIST_ORDER = (
-    "CASE status WHEN 'pending' THEN 0 WHEN 'wip' THEN 1 ELSE 2 END, id"
+    "CASE status WHEN 'pending' THEN 0 WHEN 'wip' THEN 1 ELSE 2 END,"
+    " priority DESC, id"
 )
 
 
@@ -52,6 +54,12 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+    if "priority" not in cols:
+        conn.execute(
+            "ALTER TABLE features ADD COLUMN priority"
+            " INTEGER NOT NULL DEFAULT 0"
+        )
     return conn
 
 
@@ -80,7 +88,7 @@ def cmd_pop(conn: sqlite3.Connection, agent_id: str) -> dict | None:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM features WHERE status = 'pending'"
-            " ORDER BY id LIMIT 1"
+            " ORDER BY priority DESC, id LIMIT 1"
         ).fetchone()
         if row is None:
             conn.execute("ROLLBACK")
@@ -150,6 +158,36 @@ def _transition(
     )
 
 
+def cmd_bump(conn: sqlite3.Connection, feature_id: int) -> dict:
+    """Move a pending feature to the front of the queue."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM features WHERE id = ?", (feature_id,)
+        ).fetchone()
+        if row is None:
+            raise BacklogError(f"feature {feature_id} not found")
+        if row["status"] != "pending":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not pending"
+            )
+        conn.execute(
+            "UPDATE features SET priority ="
+            " (SELECT COALESCE(MAX(priority), 0) + 1 FROM features)"
+            " WHERE id = ?",
+            (feature_id,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return feature_dict(
+        conn.execute(
+            "SELECT * FROM features WHERE id = ?", (feature_id,)
+        ).fetchone()
+    )
+
+
 def cmd_list(conn: sqlite3.Connection, include_done: bool) -> list[dict]:
     where = "" if include_done else "WHERE status != 'done'"
     rows = conn.execute(
@@ -162,14 +200,18 @@ def print_list(features: list[dict]) -> None:
     if not features:
         print("queue is empty")
         return
-    print(f"{'ID':<5}{'STATUS':<9}{'AGENT':<16}{'CREATED':<26}TITLE")
+    print(
+        f"{'ID':<5}{'STATUS':<9}{'PRIO':<6}{'AGENT':<16}"
+        f"{'CREATED':<26}TITLE"
+    )
     for f in features:
         title = f["title"]
         if len(title) > 60:
             title = title[:57] + "..."
+        prio = str(f["priority"]) if f["priority"] else "-"
         print(
-            f"{f['id']:<5}{f['status']:<9}{(f['agent_id'] or '-'):<16}"
-            f"{f['created_at']:<26}{title}"
+            f"{f['id']:<5}{f['status']:<9}{prio:<6}"
+            f"{(f['agent_id'] or '-'):<16}{f['created_at']:<26}{title}"
         )
 
 
@@ -180,6 +222,8 @@ def print_feature(f: dict, header: str) -> None:
     if f["description"]:
         print(f"  description: {f['description']}")
     print(f"  status:      {f['status']}")
+    if f["priority"]:
+        print(f"  priority:    {f['priority']}")
     if f["agent_id"]:
         print(f"  agent:       {f['agent_id']}")
 
@@ -214,6 +258,12 @@ def main(argv: list[str] | None = None) -> int:
         metavar="ID",
         type=int,
         help="give a wip feature back to the pending queue",
+    )
+    ops.add_argument(
+        "--bump",
+        metavar="ID",
+        type=int,
+        help="move a pending feature to the front of the queue",
     )
     ops.add_argument(
         "--list",
@@ -288,6 +338,10 @@ def main(argv: list[str] | None = None) -> int:
                             args.force, "release")
             emit(f, args.as_json,
                  lambda: print(f"feature #{f['id']} back to pending"))
+        elif args.bump is not None:
+            f = cmd_bump(conn, args.bump)
+            emit(f, args.as_json,
+                 lambda: print(f"feature #{f['id']} moved to front"))
         else:  # --list
             fs = cmd_list(conn, args.all)
             emit(fs, args.as_json, lambda: print_list(fs))
