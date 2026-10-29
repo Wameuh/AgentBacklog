@@ -16,7 +16,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS features (
     status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'wip', 'done')),
     priority    INTEGER NOT NULL DEFAULT 0,
+    depends_on  INTEGER REFERENCES features(id),
     agent_id    TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at  TEXT,
@@ -37,8 +38,8 @@ CREATE TABLE IF NOT EXISTS features (
 """
 
 LIST_ORDER = (
-    "CASE status WHEN 'pending' THEN 0 WHEN 'wip' THEN 1 ELSE 2 END,"
-    " priority DESC, id"
+    "CASE f.status WHEN 'pending' THEN 0 WHEN 'wip' THEN 1 ELSE 2 END,"
+    " f.priority DESC, f.id"
 )
 
 
@@ -60,6 +61,11 @@ def connect(path: Path) -> sqlite3.Connection:
             "ALTER TABLE features ADD COLUMN priority"
             " INTEGER NOT NULL DEFAULT 0"
         )
+    if "depends_on" not in cols:
+        conn.execute(
+            "ALTER TABLE features ADD COLUMN depends_on"
+            " INTEGER REFERENCES features(id)"
+        )
     return conn
 
 
@@ -71,10 +77,27 @@ def feature_dict(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
 
 
-def cmd_add(conn: sqlite3.Connection, title: str, description: str) -> dict:
+def _require_feature(conn: sqlite3.Connection, feature_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM features WHERE id = ?", (feature_id,)
+    ).fetchone()
+    if row is None:
+        raise BacklogError(f"feature {feature_id} not found")
+    return row
+
+
+def cmd_add(
+    conn: sqlite3.Connection,
+    title: str,
+    description: str,
+    depends_on: int | None,
+) -> dict:
+    if depends_on is not None:
+        _require_feature(conn, depends_on)
     cur = conn.execute(
-        "INSERT INTO features (title, description) VALUES (?, ?)",
-        (title, description),
+        "INSERT INTO features (title, description, depends_on)"
+        " VALUES (?, ?, ?)",
+        (title, description, depends_on),
     )
     return feature_dict(
         conn.execute(
@@ -83,16 +106,24 @@ def cmd_add(conn: sqlite3.Connection, title: str, description: str) -> dict:
     )
 
 
-def cmd_pop(conn: sqlite3.Connection, agent_id: str) -> dict | None:
+def cmd_pop(
+    conn: sqlite3.Connection, agent_id: str
+) -> tuple[dict | None, int]:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT * FROM features WHERE status = 'pending'"
-            " ORDER BY priority DESC, id LIMIT 1"
+            "SELECT f.* FROM features f"
+            " LEFT JOIN features d ON f.depends_on = d.id"
+            " WHERE f.status = 'pending'"
+            " AND (f.depends_on IS NULL OR d.status = 'done')"
+            " ORDER BY f.priority DESC, f.id LIMIT 1"
         ).fetchone()
         if row is None:
+            blocked = conn.execute(
+                "SELECT COUNT(*) AS n FROM features WHERE status = 'pending'"
+            ).fetchone()["n"]
             conn.execute("ROLLBACK")
-            return None
+            return None, blocked
         conn.execute(
             "UPDATE features SET status = 'wip', agent_id = ?,"
             " started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
@@ -103,9 +134,62 @@ def cmd_pop(conn: sqlite3.Connection, agent_id: str) -> dict | None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    return (
+        feature_dict(
+            conn.execute(
+                "SELECT * FROM features WHERE id = ?", (row["id"],)
+            ).fetchone()
+        ),
+        0,
+    )
+
+
+def cmd_depend(
+    conn: sqlite3.Connection, feature_id: int, depends_on: int
+) -> dict:
+    """Set (or clear, when depends_on == 0) a feature's dependency."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if row["status"] != "pending":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not pending"
+            )
+        if depends_on == 0:
+            conn.execute(
+                "UPDATE features SET depends_on = NULL WHERE id = ?",
+                (feature_id,),
+            )
+        else:
+            if depends_on == feature_id:
+                raise BacklogError("a feature cannot depend on itself")
+            _require_feature(conn, depends_on)
+            cur: int | None = depends_on
+            seen: set[int] = set()
+            while cur is not None:
+                if cur == feature_id:
+                    raise BacklogError(
+                        f"dependency cycle: {feature_id} would depend"
+                        " on itself through the chain"
+                    )
+                if cur in seen:
+                    break
+                seen.add(cur)
+                r = conn.execute(
+                    "SELECT depends_on FROM features WHERE id = ?", (cur,)
+                ).fetchone()
+                cur = r["depends_on"] if r is not None else None
+            conn.execute(
+                "UPDATE features SET depends_on = ? WHERE id = ?",
+                (depends_on, feature_id),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     return feature_dict(
         conn.execute(
-            "SELECT * FROM features WHERE id = ?", (row["id"],)
+            "SELECT * FROM features WHERE id = ?", (feature_id,)
         ).fetchone()
     )
 
@@ -189,9 +273,11 @@ def cmd_bump(conn: sqlite3.Connection, feature_id: int) -> dict:
 
 
 def cmd_list(conn: sqlite3.Connection, include_done: bool) -> list[dict]:
-    where = "" if include_done else "WHERE status != 'done'"
+    where = "" if include_done else "WHERE f.status != 'done'"
     rows = conn.execute(
-        f"SELECT * FROM features {where} ORDER BY {LIST_ORDER}"
+        f"SELECT f.*, d.status AS dep_status FROM features f"
+        f" LEFT JOIN features d ON f.depends_on = d.id"
+        f" {where} ORDER BY {LIST_ORDER}"
     ).fetchall()
     return [feature_dict(r) for r in rows]
 
@@ -201,7 +287,7 @@ def print_list(features: list[dict]) -> None:
         print("queue is empty")
         return
     print(
-        f"{'ID':<5}{'STATUS':<9}{'PRIO':<6}{'AGENT':<16}"
+        f"{'ID':<5}{'STATUS':<9}{'PRIO':<6}{'DEP':<6}{'AGENT':<16}"
         f"{'CREATED':<26}TITLE"
     )
     for f in features:
@@ -209,8 +295,14 @@ def print_list(features: list[dict]) -> None:
         if len(title) > 60:
             title = title[:57] + "..."
         prio = str(f["priority"]) if f["priority"] else "-"
+        if f["depends_on"] is None:
+            dep = "-"
+        elif f.get("dep_status") == "done":
+            dep = str(f["depends_on"])
+        else:
+            dep = f"!{f['depends_on']}"
         print(
-            f"{f['id']:<5}{f['status']:<9}{prio:<6}"
+            f"{f['id']:<5}{f['status']:<9}{prio:<6}{dep:<6}"
             f"{(f['agent_id'] or '-'):<16}{f['created_at']:<26}{title}"
         )
 
@@ -224,6 +316,8 @@ def print_feature(f: dict, header: str) -> None:
     print(f"  status:      {f['status']}")
     if f["priority"]:
         print(f"  priority:    {f['priority']}")
+    if f["depends_on"] is not None:
+        print(f"  depends on:  #{f['depends_on']}")
     if f["agent_id"]:
         print(f"  agent:       {f['agent_id']}")
 
@@ -266,6 +360,14 @@ def main(argv: list[str] | None = None) -> int:
         help="move a pending feature to the front of the queue",
     )
     ops.add_argument(
+        "--depend",
+        metavar=("ID", "DEP"),
+        type=int,
+        nargs=2,
+        help="make pending feature ID depend on DEP"
+        " (it can only pop once DEP is done); DEP=0 clears",
+    )
+    ops.add_argument(
         "--list",
         action="store_true",
         help="list pending and wip features",
@@ -279,6 +381,12 @@ def main(argv: list[str] | None = None) -> int:
         dest="description",
         default="",
         help="longer description for --add",
+    )
+    parser.add_argument(
+        "--depends-on",
+        metavar="ID",
+        type=int,
+        help="with --add: the new feature depends on feature ID",
     )
     parser.add_argument(
         "--all",
@@ -308,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--release needs --agent-id (or --force)")
     if args.all and not args.list:
         parser.error("--all only makes sense with --list")
+    if args.depends_on is not None and args.add is None:
+        parser.error("--depends-on only makes sense with --add")
 
     path = args.db or db_path()
     try:
@@ -318,13 +428,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.add is not None:
-            f = cmd_add(conn, args.add, args.description)
+            f = cmd_add(conn, args.add, args.description, args.depends_on)
             emit(f, args.as_json,
                  lambda: print(f"queued feature #{f['id']}: {f['title']}"))
         elif args.pop:
-            f = cmd_pop(conn, args.agent_id)
+            f, blocked = cmd_pop(conn, args.agent_id)
             if f is None:
-                print("queue is empty", file=sys.stderr)
+                if blocked:
+                    print(
+                        f"queue empty — {blocked} pending feature(s)"
+                        " blocked by dependencies",
+                        file=sys.stderr,
+                    )
+                else:
+                    print("queue is empty", file=sys.stderr)
                 return 1
             emit(f, args.as_json,
                  lambda: print_feature(f, f"popped feature #{f['id']}"))
@@ -342,6 +459,14 @@ def main(argv: list[str] | None = None) -> int:
             f = cmd_bump(conn, args.bump)
             emit(f, args.as_json,
                  lambda: print(f"feature #{f['id']} moved to front"))
+        elif args.depend is not None:
+            fid, dep = args.depend
+            f = cmd_depend(conn, fid, dep)
+            msg = (
+                f"feature #{fid} dependency cleared" if dep == 0
+                else f"feature #{fid} now depends on #{dep}"
+            )
+            emit(f, args.as_json, lambda: print(msg))
         else:  # --list
             fs = cmd_list(conn, args.all)
             emit(fs, args.as_json, lambda: print_list(fs))
