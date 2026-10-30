@@ -11,10 +11,14 @@ for the next item.
 ## Install
 
 ```bash
-# as a uv tool (editable install reflects repo changes immediately)
-uv tool install --editable .
+# as a uv tool
+uv tool install .
 
-# or just run the script — stdlib only, no dependencies
+# or symlink the script — stdlib only, always reflects the checkout
+ln -sf "$PWD/agentbacklog.py" ~/.local/bin/agentbacklog
+ln -sf "$PWD/agentbacklog.py" ~/.local/bin/AgentBacklog
+
+# or just run it in place
 ./agentbacklog.py --help
 ```
 
