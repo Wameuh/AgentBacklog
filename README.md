@@ -43,7 +43,7 @@ agentbacklog --list --all                      # include archived (done)
 |---|---|
 | `--add TITLE [--desc TXT] [--depends-on ID] [--repo NAME]` | Enqueue a feature (→ `pending`), optionally dep-blocked and/or repo-scoped |
 | `--depend ID DEP` | Make `pending` feature `ID` depend on `DEP` (`DEP=0` clears). Rejects self-deps, cycles, non-pending items |
-| `--pop --agent-id A [--repo NAME]` | Take the highest-priority/oldest eligible `pending` → `wip`, assigned to agent `A` |
+| `--pop --agent-id A [--repo NAME]` | Take the highest-priority/oldest eligible `pending` → `wip`; `--repo` restricts to that repo + untagged |
 | `--done ID --agent-id A` | Mark a `wip` feature `done` (archived). Ownership-checked, `--force` overrides |
 | `--release ID --agent-id A` | Give a `wip` feature back to `pending` |
 | `--bump ID` | Move a `pending` feature to the front of the queue |
@@ -75,9 +75,10 @@ One backlog can serve several repos or workspaces. Tag a feature with
 `--repo NAME` at `--add` time (the value is a free-form string — repo
 name, path, workspace id…). Then:
 
-- `agentbacklog --pop --agent-id A --repo NAME` only takes features tagged
-  `NAME` **or untagged** — an agent never steals another repo's work.
-- `--pop` without `--repo` only takes untagged features.
+- `agentbacklog --pop --agent-id A` takes **any** eligible feature — the
+  tag is informational, telling the agent which repo to work on.
+- `--pop --repo NAME` restricts to features tagged `NAME` **or untagged** —
+  use it for sessions dedicated to one repo.
 - `--list --repo NAME` filters the listing; the `REPO` column shows the tag.
 - `--done`/`--release`/`--bump`/`--depend` address features by id and are
   repo-agnostic.

@@ -22,7 +22,7 @@ Features are enqueued, popped (FIFO, tunable via `--bump` priority and
 | Command | Role |
 |---|---|
 | `agentbacklog --add "Title" [--desc "..."] [--depends-on ID] [--repo NAME]` | Enqueue a feature (→ pending), optionally dep-blocked and/or repo-scoped |
-| `agentbacklog --pop --agent-id <id> [--repo NAME] [--json]` | Take the highest-priority/oldest eligible pending → wip |
+| `agentbacklog --pop --agent-id <id> [--repo NAME] [--json]` | Take the highest-priority/oldest eligible pending → wip; `--repo` restricts to NAME + untagged |
 | `agentbacklog --done <ID> --agent-id <id>` | wip → done (archived) |
 | `agentbacklog --release <ID> --agent-id <id>` | wip → back to pending |
 | `agentbacklog --bump <ID>` | Move a pending feature to the front |
@@ -34,11 +34,12 @@ ownership checks on done/release: never use without an explicit ask.
 
 Semantics: service order is `priority DESC`, then `id`. `--bump` puts an
 item first. A feature with `depends_on` is only eligible once its
-dependency is `done` (list `DEP` shows `!ID` = blocked). A feature tagged
-`--repo NAME` is only poppable with the same `--repo`; untagged items are
-open to everyone; `--pop` without `--repo` takes untagged only. Export
-`AGENTBACKLOG_REPO=<name>` to scope a whole session. `--workspace` is an
-alias of `--repo`.
+dependency is `done` (list `DEP` shows `!ID` = blocked). The `--repo NAME`
+tag is informational — it tells the agent which repo to work on. `--pop`
+without `--repo` takes **any** eligible feature (tagged or not);
+`--pop --repo NAME` restricts to `NAME` + untagged (repo-dedicated
+session). Export `AGENTBACKLOG_REPO=<name>` to scope a whole session.
+`--workspace` is an alias of `--repo`.
 
 ## Agent protocol
 

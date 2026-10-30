@@ -16,7 +16,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -116,9 +116,7 @@ def cmd_pop(
     try:
         conn.execute("BEGIN IMMEDIATE")
         scope = (
-            "AND (f.repo IS NULL OR f.repo = ?)"
-            if repo is not None
-            else "AND f.repo IS NULL"
+            "AND (f.repo IS NULL OR f.repo = ?)" if repo is not None else ""
         )
         row = conn.execute(
             "SELECT f.* FROM features f"
@@ -418,8 +416,9 @@ def main(argv: list[str] | None = None) -> int:
         dest="repo",
         metavar="NAME",
         help="with --add: tag the feature for a repo/workspace;"
-        " with --pop: only take features for it (plus untagged);"
-        " with --list: filter. Default: $AGENTBACKLOG_REPO",
+        " with --pop: restrict to features for it (plus untagged);"
+        " without it, pop takes anything; with --list: filter."
+        " Default: $AGENTBACKLOG_REPO",
     )
     parser.add_argument(
         "--depends-on",
