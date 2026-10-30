@@ -25,7 +25,8 @@ Provides two entry points: `agentbacklog` and `AgentBacklog`.
 ```bash
 agentbacklog --add "Add retry logic" --desc "exponential backoff, max 3"
 agentbacklog --add "Docs" --depends-on 1       # only poppable once #1 is done
-agentbacklog --pop --agent-id devin-1 --json   # take oldest eligible → wip
+agentbacklog --add "AC theme" --repo AgentControl  # scoped to a repo
+agentbacklog --pop --agent-id devin-1 --repo AgentControl --json
 agentbacklog --done 3 --agent-id devin-1       # wip → done (archived)
 agentbacklog --release 3 --agent-id devin-1    # wip → back to pending
 agentbacklog --bump 4                          # pending → front of queue
@@ -36,16 +37,18 @@ agentbacklog --list --all                      # include archived (done)
 
 | Command | Description |
 |---|---|
-| `--add TITLE [--desc TXT] [--depends-on ID]` | Enqueue a feature (→ `pending`), optionally blocked until `ID` is done |
+| `--add TITLE [--desc TXT] [--depends-on ID] [--repo NAME]` | Enqueue a feature (→ `pending`), optionally dep-blocked and/or repo-scoped |
 | `--depend ID DEP` | Make `pending` feature `ID` depend on `DEP` (`DEP=0` clears). Rejects self-deps, cycles, non-pending items |
-| `--pop --agent-id A` | Take the highest-priority/oldest `pending` → `wip`, assigned to agent `A` |
+| `--pop --agent-id A [--repo NAME]` | Take the highest-priority/oldest eligible `pending` → `wip`, assigned to agent `A` |
 | `--done ID --agent-id A` | Mark a `wip` feature `done` (archived). Ownership-checked, `--force` overrides |
 | `--release ID --agent-id A` | Give a `wip` feature back to `pending` |
 | `--bump ID` | Move a `pending` feature to the front of the queue |
-| `--list [--all]` | List `pending`+`wip` (`--all` includes `done`) |
+| `--list [--all] [--repo NAME]` | List `pending`+`wip` (`--all` includes `done`), optionally filtered by repo |
 | `--json` | Machine-readable output |
 | `--db PATH` | Override database path |
 | `--version` | Print version |
+
+`--workspace` is an alias for `--repo`.
 
 ### Priority
 
@@ -62,13 +65,31 @@ but is **not eligible for `--pop`** until its dependency is `done` —
 explicitly. Cycles, self-dependencies and dependencies on non-existent or
 non-`pending` features are rejected.
 
+### Repo/workspace scoping
+
+One backlog can serve several repos or workspaces. Tag a feature with
+`--repo NAME` at `--add` time (the value is a free-form string — repo
+name, path, workspace id…). Then:
+
+- `agentbacklog --pop --agent-id A --repo NAME` only takes features tagged
+  `NAME` **or untagged** — an agent never steals another repo's work.
+- `--pop` without `--repo` only takes untagged features.
+- `--list --repo NAME` filters the listing; the `REPO` column shows the tag.
+- `--done`/`--release`/`--bump`/`--depend` address features by id and are
+  repo-agnostic.
+
+Set `AGENTBACKLOG_REPO` in the environment to scope `--add`/`--pop` for a
+whole session without repeating the flag.
+
 ## Agent workflow
 
 1. Choose a stable `--agent-id` for the session (session name, hostname…)
-   and reuse it for `pop`/`done`/`release`.
+   and reuse it for `pop`/`done`/`release`. Set `AGENTBACKLOG_REPO` if the
+   session is dedicated to one repo.
 2. `agentbacklog --pop --agent-id <id> --json` — exit `0` returns the
-   assigned feature (`id`, `title`, `description`); exit `1` means the
-   queue is empty.
+   assigned feature (`id`, `title`, `description`, `repo`); exit `1` means
+   the queue is empty (or only holds blocked/out-of-scope items — the
+   message says which).
 3. Implement the feature (`title`+`description` is the spec).
 4. `agentbacklog --done <ID> --agent-id <id>` once the work is verified.
    Abandoning? `--release` returns it to the queue.
@@ -81,8 +102,8 @@ Default database: `~/.agentbacklog/backlog.db`. Override with the
 `AGENTBACKLOG_DB` environment variable or `--db PATH`.
 
 Schema: one `features` table (`id`, `title`, `description`,
-`status` ∈ `pending|wip|done`, `priority`, `depends_on`, `agent_id`,
-`created_at`, `started_at`, `done_at`). New columns are added
+`status` ∈ `pending|wip|done`, `priority`, `depends_on`, `repo`,
+`agent_id`, `created_at`, `started_at`, `done_at`). New columns are added
 automatically to older databases.
 
 ## Contributing

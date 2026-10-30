@@ -16,7 +16,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS features (
                 CHECK (status IN ('pending', 'wip', 'done')),
     priority    INTEGER NOT NULL DEFAULT 0,
     depends_on  INTEGER REFERENCES features(id),
+    repo        TEXT,
     agent_id    TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at  TEXT,
@@ -66,6 +67,8 @@ def connect(path: Path) -> sqlite3.Connection:
             "ALTER TABLE features ADD COLUMN depends_on"
             " INTEGER REFERENCES features(id)"
         )
+    if "repo" not in cols:
+        conn.execute("ALTER TABLE features ADD COLUMN repo TEXT")
     return conn
 
 
@@ -91,13 +94,14 @@ def cmd_add(
     title: str,
     description: str,
     depends_on: int | None,
+    repo: str | None,
 ) -> dict:
     if depends_on is not None:
         _require_feature(conn, depends_on)
     cur = conn.execute(
-        "INSERT INTO features (title, description, depends_on)"
-        " VALUES (?, ?, ?)",
-        (title, description, depends_on),
+        "INSERT INTO features (title, description, depends_on, repo)"
+        " VALUES (?, ?, ?, ?)",
+        (title, description, depends_on, repo),
     )
     return feature_dict(
         conn.execute(
@@ -107,20 +111,33 @@ def cmd_add(
 
 
 def cmd_pop(
-    conn: sqlite3.Connection, agent_id: str
+    conn: sqlite3.Connection, agent_id: str, repo: str | None
 ) -> tuple[dict | None, int]:
     try:
         conn.execute("BEGIN IMMEDIATE")
+        scope = (
+            "AND (f.repo IS NULL OR f.repo = ?)"
+            if repo is not None
+            else "AND f.repo IS NULL"
+        )
         row = conn.execute(
             "SELECT f.* FROM features f"
             " LEFT JOIN features d ON f.depends_on = d.id"
             " WHERE f.status = 'pending'"
             " AND (f.depends_on IS NULL OR d.status = 'done')"
-            " ORDER BY f.priority DESC, f.id LIMIT 1"
+            f" {scope}"
+            " ORDER BY f.priority DESC, f.id LIMIT 1",
+            (repo,) if repo is not None else (),
         ).fetchone()
         if row is None:
             blocked = conn.execute(
-                "SELECT COUNT(*) AS n FROM features WHERE status = 'pending'"
+                "SELECT COUNT(*) AS n FROM features f"
+                " LEFT JOIN features d ON f.depends_on = d.id"
+                " WHERE f.status = 'pending'"
+                " AND f.depends_on IS NOT NULL"
+                " AND (d.status IS NULL OR d.status != 'done')"
+                f" {scope}",
+                (repo,) if repo is not None else (),
             ).fetchone()["n"]
             conn.execute("ROLLBACK")
             return None, blocked
@@ -272,12 +289,20 @@ def cmd_bump(conn: sqlite3.Connection, feature_id: int) -> dict:
     )
 
 
-def cmd_list(conn: sqlite3.Connection, include_done: bool) -> list[dict]:
-    where = "" if include_done else "WHERE f.status != 'done'"
+def cmd_list(
+    conn: sqlite3.Connection, include_done: bool, repo: str | None
+) -> list[dict]:
+    conds = [] if include_done else ["f.status != 'done'"]
+    params: tuple = ()
+    if repo is not None:
+        conds.append("f.repo = ?")
+        params = (repo,)
+    where = f"WHERE {' AND '.join(conds)}" if conds else ""
     rows = conn.execute(
         f"SELECT f.*, d.status AS dep_status FROM features f"
         f" LEFT JOIN features d ON f.depends_on = d.id"
-        f" {where} ORDER BY {LIST_ORDER}"
+        f" {where} ORDER BY {LIST_ORDER}",
+        params,
     ).fetchall()
     return [feature_dict(r) for r in rows]
 
@@ -287,14 +312,17 @@ def print_list(features: list[dict]) -> None:
         print("queue is empty")
         return
     print(
-        f"{'ID':<5}{'STATUS':<9}{'PRIO':<6}{'DEP':<6}{'AGENT':<16}"
-        f"{'CREATED':<26}TITLE"
+        f"{'ID':<5}{'STATUS':<9}{'PRIO':<6}{'DEP':<6}{'REPO':<16}"
+        f"{'AGENT':<16}{'CREATED':<26}TITLE"
     )
     for f in features:
         title = f["title"]
         if len(title) > 60:
             title = title[:57] + "..."
         prio = str(f["priority"]) if f["priority"] else "-"
+        repo = f["repo"] or "-"
+        if len(repo) > 15:
+            repo = repo[:12] + "..."
         if f["depends_on"] is None:
             dep = "-"
         elif f.get("dep_status") == "done":
@@ -302,7 +330,7 @@ def print_list(features: list[dict]) -> None:
         else:
             dep = f"!{f['depends_on']}"
         print(
-            f"{f['id']:<5}{f['status']:<9}{prio:<6}{dep:<6}"
+            f"{f['id']:<5}{f['status']:<9}{prio:<6}{dep:<6}{repo:<16}"
             f"{(f['agent_id'] or '-'):<16}{f['created_at']:<26}{title}"
         )
 
@@ -318,6 +346,8 @@ def print_feature(f: dict, header: str) -> None:
         print(f"  priority:    {f['priority']}")
     if f["depends_on"] is not None:
         print(f"  depends on:  #{f['depends_on']}")
+    if f["repo"]:
+        print(f"  repo:        {f['repo']}")
     if f["agent_id"]:
         print(f"  agent:       {f['agent_id']}")
 
@@ -383,6 +413,15 @@ def main(argv: list[str] | None = None) -> int:
         help="longer description for --add",
     )
     parser.add_argument(
+        "--repo",
+        "--workspace",
+        dest="repo",
+        metavar="NAME",
+        help="with --add: tag the feature for a repo/workspace;"
+        " with --pop: only take features for it (plus untagged);"
+        " with --list: filter. Default: $AGENTBACKLOG_REPO",
+    )
+    parser.add_argument(
         "--depends-on",
         metavar="ID",
         type=int,
@@ -418,6 +457,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--all only makes sense with --list")
     if args.depends_on is not None and args.add is None:
         parser.error("--depends-on only makes sense with --add")
+    if args.repo is not None and not (
+        args.add is not None or args.pop or args.list
+    ):
+        parser.error("--repo only makes sense with --add/--pop/--list")
+
+    resolved_repo = args.repo or os.environ.get("AGENTBACKLOG_REPO")
 
     path = args.db or db_path()
     try:
@@ -428,20 +473,26 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.add is not None:
-            f = cmd_add(conn, args.add, args.description, args.depends_on)
+            f = cmd_add(
+                conn, args.add, args.description, args.depends_on,
+                resolved_repo,
+            )
             emit(f, args.as_json,
                  lambda: print(f"queued feature #{f['id']}: {f['title']}"))
         elif args.pop:
-            f, blocked = cmd_pop(conn, args.agent_id)
+            f, blocked = cmd_pop(conn, args.agent_id, resolved_repo)
             if f is None:
+                scope_txt = (
+                    f" for repo {resolved_repo!r}" if resolved_repo else ""
+                )
                 if blocked:
                     print(
                         f"queue empty — {blocked} pending feature(s)"
-                        " blocked by dependencies",
+                        f" blocked by dependencies{scope_txt}",
                         file=sys.stderr,
                     )
                 else:
-                    print("queue is empty", file=sys.stderr)
+                    print(f"queue is empty{scope_txt}", file=sys.stderr)
                 return 1
             emit(f, args.as_json,
                  lambda: print_feature(f, f"popped feature #{f['id']}"))
@@ -468,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             emit(f, args.as_json, lambda: print(msg))
         else:  # --list
-            fs = cmd_list(conn, args.all)
+            fs = cmd_list(conn, args.all, args.repo)
             emit(fs, args.as_json, lambda: print_list(fs))
     except BacklogError as e:
         print(f"agentbacklog: {e}", file=sys.stderr)
