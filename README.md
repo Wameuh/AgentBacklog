@@ -28,21 +28,21 @@ Provides two entry points: `agentbacklog` and `AgentBacklog`.
 
 ```bash
 agentbacklog --add "Add retry logic" --desc "exponential backoff, max 3"
-agentbacklog --add "Docs" --depends-on 1       # only poppable once #1 is done
+agentbacklog --add "Docs" --depends-on 1 --depends-on 2  # poppable once #1 AND #2 are done
 agentbacklog --add "AC theme" --repo AgentControl  # scoped to a repo
 agentbacklog --pop --agent-id devin-1 --repo AgentControl --json
 agentbacklog --done 3 --agent-id devin-1       # wip → done (archived)
 agentbacklog --release 3 --agent-id devin-1    # wip → back to pending
 agentbacklog --bump 4                          # pending → front of queue
-agentbacklog --depend 5 2                      # pending #5 depends on #2 (0 clears)
+agentbacklog --depend 5 2 3                    # #5 depends on #2 AND #3 (0 clears)
 agentbacklog --list                            # pending + wip
 agentbacklog --list --all                      # include archived (done)
 ```
 
 | Command | Description |
 |---|---|
-| `--add TITLE [--desc TXT] [--depends-on ID] [--repo NAME]` | Enqueue a feature (→ `pending`), optionally dep-blocked and/or repo-scoped |
-| `--depend ID DEP` | Make `pending` feature `ID` depend on `DEP` (`DEP=0` clears). Rejects self-deps, cycles, non-pending items |
+| `--add TITLE [--desc TXT] [--depends-on ID]… [--repo NAME]` | Enqueue a feature (→ `pending`), optionally dep-blocked (repeat `--depends-on`) and/or repo-scoped |
+| `--depend ID DEP [DEP…]` | Set `pending` feature `ID`'s dependencies — poppable once **all** are done (`0` clears all). Rejects self-deps, cycles, non-pending items |
 | `--pop --agent-id A [--repo NAME]` | Take the highest-priority/oldest eligible `pending` → `wip`; `--repo` restricts to that repo + untagged |
 | `--done ID --agent-id A` | Mark a `wip` feature `done` (archived). Ownership-checked, `--force` overrides |
 | `--release ID --agent-id A` | Give a `wip` feature back to `pending` |
@@ -62,12 +62,16 @@ bumped items stay ahead of unprioritized ones.
 
 ### Dependencies
 
-A feature can depend on another one. A dependent feature stays `pending`
-but is **not eligible for `--pop`** until its dependency is `done` —
-`--pop` skips it and the `--list` `DEP` column shows it as `!ID` (versus
-`ID` when satisfied). If every pending feature is blocked, `--pop` says so
-explicitly. Cycles, self-dependencies and dependencies on non-existent or
-non-`pending` features are rejected.
+A feature can depend on one or **several** others (`--depends-on` repeated
+at `--add`, or `--depend ID DEP DEP…` afterwards — the command replaces the
+whole set). A dependent feature stays `pending` but is **not eligible for
+`--pop`** until **all** its dependencies are `done` — `--pop` skips it and
+the `--list` `DEP` column shows per-dep markers (`!ID` = blocking, `ID` =
+satisfied, e.g. `!2,5`). If every pending feature is blocked, `--pop` says
+so explicitly. Cycles (including multi-hop), self-dependencies and
+dependencies on non-existent or non-`pending` features are rejected.
+
+The JSON output exposes `dependencies` as `[{"id": N, "status": …}]`.
 
 ### Repo/workspace scoping
 
@@ -106,10 +110,12 @@ whole session without repeating the flag.
 Default database: `~/.agentbacklog/backlog.db`. Override with the
 `AGENTBACKLOG_DB` environment variable or `--db PATH`.
 
-Schema: one `features` table (`id`, `title`, `description`,
-`status` ∈ `pending|wip|done`, `priority`, `depends_on`, `repo`,
-`agent_id`, `created_at`, `started_at`, `done_at`). New columns are added
-automatically to older databases.
+Schema: `features` (`id`, `title`, `description`,
+`status` ∈ `pending|wip|done`, `priority`, `repo`, `agent_id`,
+`created_at`, `started_at`, `done_at`) plus `feature_deps`
+(`feature_id`, `depends_on`) for dependencies. New columns/tables are
+added automatically to older databases (a legacy `depends_on` column is
+migrated into `feature_deps` then dropped).
 
 ## Contributing
 
