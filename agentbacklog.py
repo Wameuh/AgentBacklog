@@ -14,26 +14,43 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
 
-SCHEMA = """\
-CREATE TABLE IF NOT EXISTS features (
+FEATURES_DEF = """\
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title       TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'wip', 'done')),
+                CHECK (status IN ('pending', 'wip', 'plan_review',
+                                  'reviewing', 'done')),
     priority    INTEGER NOT NULL DEFAULT 0,
     repo        TEXT,
     agent_id    TEXT,
+    plan_file   TEXT,
+    plan_content TEXT,
+    reviewer_id TEXT,
+    review_round INTEGER NOT NULL DEFAULT 0,
+    no_plan     INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at  TEXT,
-    done_at     TEXT
+    done_at     TEXT"""
+
+# column order used by the schema rebuild — keep in sync with FEATURES_DEF
+FEATURE_COLUMNS = [
+    "id", "title", "description", "status", "priority", "repo",
+    "agent_id", "plan_file", "plan_content", "reviewer_id",
+    "review_round", "no_plan", "created_at", "started_at", "done_at",
+]
+
+SCHEMA = f"""\
+CREATE TABLE IF NOT EXISTS features (
+{FEATURES_DEF}
 );
 
 CREATE TABLE IF NOT EXISTS feature_deps (
@@ -41,10 +58,22 @@ CREATE TABLE IF NOT EXISTS feature_deps (
     depends_on  INTEGER NOT NULL REFERENCES features(id),
     PRIMARY KEY (feature_id, depends_on)
 );
+
+CREATE TABLE IF NOT EXISTS feature_reviews (
+    feature_id  INTEGER NOT NULL REFERENCES features(id),
+    round       INTEGER NOT NULL,
+    reviewer_id TEXT,
+    verdict     TEXT NOT NULL
+                CHECK (verdict IN ('approved', 'denied', 'conditional')),
+    comment     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (feature_id, round)
+);
 """
 
 LIST_ORDER = (
-    "CASE f.status WHEN 'pending' THEN 0 WHEN 'wip' THEN 1 ELSE 2 END,"
+    "CASE f.status WHEN 'pending' THEN 0 WHEN 'wip' THEN 1"
+    " WHEN 'plan_review' THEN 2 WHEN 'reviewing' THEN 3 ELSE 4 END,"
     " f.priority DESC, f.id"
 )
 
@@ -79,7 +108,48 @@ def connect(path: Path) -> sqlite3.Connection:
             conn.execute("ALTER TABLE features DROP COLUMN depends_on")
         except sqlite3.Error:
             pass  # sqlite < 3.35: column stays but is unused
+    # v0.7: the status CHECK is baked into the table definition, so adding
+    # plan_review/reviewing (and the plan columns) needs a rebuild.
+    table_sql = conn.execute(
+        "SELECT sql FROM sqlite_master"
+        " WHERE type = 'table' AND name = 'features'"
+    ).fetchone()["sql"] or ""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+    if "'plan_review'" not in table_sql or not set(FEATURE_COLUMNS) <= cols:
+        _rebuild_features(conn, path)
     return conn
+
+
+def _rebuild_features(conn: sqlite3.Connection, path: Path) -> None:
+    """Rebuild `features` with the current schema (CHECK can't be altered).
+
+    The database file is backed up next to the db first; rows are copied
+    column-by-column so older bases (extra depends_on, missing plan_*)
+    migrate cleanly.
+    """
+    bak = path.with_name(
+        f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    )
+    dst = sqlite3.connect(str(bak))
+    try:
+        conn.backup(dst)
+    finally:
+        dst.close()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+    keep = [c for c in FEATURE_COLUMNS if c in cols]
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(f"CREATE TABLE features_new (\n{FEATURES_DEF}\n)")
+        conn.execute(
+            f"INSERT INTO features_new ({', '.join(keep)})"
+            f" SELECT {', '.join(keep)} FROM features"
+        )
+        conn.execute("DROP TABLE features")
+        conn.execute("ALTER TABLE features_new RENAME TO features")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 class BacklogError(Exception):
@@ -152,13 +222,15 @@ def cmd_add(
     description: str,
     depends_on: list[int] | None,
     repo: str | None,
+    no_plan: bool,
 ) -> dict:
     deps = set(depends_on or [])
     for dep in deps:
         _require_feature(conn, dep)
     cur = conn.execute(
-        "INSERT INTO features (title, description, repo) VALUES (?, ?, ?)",
-        (title, description, repo),
+        "INSERT INTO features (title, description, repo, no_plan)"
+        " VALUES (?, ?, ?, ?)",
+        (title, description, repo, int(no_plan)),
     )
     fid = cur.lastrowid
     for dep in deps:
@@ -258,6 +330,241 @@ def cmd_depend(
         conn.execute("ROLLBACK")
         raise
     return _get_feature(conn, feature_id)
+
+
+def _has_unfinished_deps(
+    conn: sqlite3.Connection, feature_id: int
+) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT EXISTS ("
+            " SELECT 1 FROM feature_deps fd"
+            " LEFT JOIN features d ON fd.depends_on = d.id"
+            " WHERE fd.feature_id = ?"
+            " AND (d.status IS NULL OR d.status != 'done'))",
+            (feature_id,),
+        ).fetchone()[0]
+    )
+
+
+def cmd_claim(
+    conn: sqlite3.Connection,
+    feature_id: int,
+    agent_id: str,
+    repo: str | None,
+) -> dict:
+    """Assign a specific pending feature to an agent (-> wip).
+
+    Unlike pop there is no queue scan — the caller picks the item, but
+    the eligibility rules are the same: pending, all deps done, repo ok.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM features WHERE id = ?", (feature_id,)
+        ).fetchone()
+        if row is None:
+            raise BacklogError(f"feature {feature_id} not found")
+        if row["status"] != "pending":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not pending"
+            )
+        if (
+            repo is not None
+            and row["repo"] is not None
+            and row["repo"] != repo
+        ):
+            raise BacklogError(
+                f"feature {feature_id} is tagged for repo"
+                f" {row['repo']!r}, not {repo!r}"
+            )
+        if _has_unfinished_deps(conn, feature_id):
+            raise BacklogError(
+                f"feature {feature_id} is blocked by unfinished"
+                " dependencies"
+            )
+        conn.execute(
+            "UPDATE features SET status = 'wip', agent_id = ?,"
+            " started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            " WHERE id = ?",
+            (agent_id, feature_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_submit_plan(
+    conn: sqlite3.Connection,
+    feature_id: int,
+    agent_id: str,
+    plan_file: str,
+    plan_content_path: str | None,
+    force: bool,
+) -> dict:
+    """wip -> plan_review: attach the plan document for the reviewer."""
+    content = None
+    for p in (plan_content_path, plan_file):
+        if not p:
+            continue
+        try:
+            content = Path(p).expanduser().read_text()
+            break
+        except OSError:
+            continue
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if row["status"] != "wip":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not wip"
+            )
+        if not force and row["agent_id"] != agent_id:
+            raise BacklogError(
+                f"feature {feature_id} is owned by agent "
+                f"{row['agent_id']!r} (use --force to override)"
+            )
+        conn.execute(
+            "UPDATE features SET status = 'plan_review', plan_file = ?,"
+            " plan_content = ?, reviewer_id = NULL WHERE id = ?",
+            (plan_file, content, feature_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_claim_review(
+    conn: sqlite3.Connection, feature_id: int, reviewer: str
+) -> dict:
+    """plan_review -> reviewing: a reviewer atomically takes the review."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if row["status"] != "plan_review":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']},"
+                " not plan_review"
+            )
+        conn.execute(
+            "UPDATE features SET status = 'reviewing', reviewer_id = ?"
+            " WHERE id = ?",
+            (reviewer, feature_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_unclaim_review(conn: sqlite3.Connection, feature_id: int) -> dict:
+    """reviewing -> plan_review: the reviewer died or timed out."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if row["status"] != "reviewing":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not reviewing"
+            )
+        conn.execute(
+            "UPDATE features SET status = 'plan_review',"
+            " reviewer_id = NULL WHERE id = ?",
+            (feature_id,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_verdict(
+    conn: sqlite3.Connection,
+    feature_id: int,
+    reviewer: str,
+    outcome: str,
+    comment: str,
+    force: bool,
+) -> dict:
+    """reviewing -> wip: record the verdict and bump review_round."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if row["status"] != "reviewing":
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not reviewing"
+            )
+        if not force and row["reviewer_id"] != reviewer:
+            raise BacklogError(
+                f"feature {feature_id} is reviewed by "
+                f"{row['reviewer_id']!r} (use --force to override)"
+            )
+        conn.execute(
+            "INSERT INTO feature_reviews"
+            " (feature_id, round, reviewer_id, verdict, comment)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (feature_id, row["review_round"], reviewer, outcome, comment),
+        )
+        conn.execute(
+            "UPDATE features SET status = 'wip',"
+            " review_round = review_round + 1 WHERE id = ?",
+            (feature_id,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_reassign(
+    conn: sqlite3.Connection,
+    feature_id: int,
+    agent_id: str,
+    force: bool,
+) -> dict:
+    """Change agent_id of a wip feature (dead planner hand-off).
+
+    --force also allows plan_review/reviewing items stuck on a dead
+    planner — the pipeline then resumes from its current state.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        ok = row["status"] == "wip" or (
+            force and row["status"] in ("plan_review", "reviewing")
+        )
+        if not ok:
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not wip"
+                + ("" if force else " (use --force for review states)")
+            )
+        conn.execute(
+            "UPDATE features SET agent_id = ? WHERE id = ?",
+            (agent_id, feature_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_reviews(conn: sqlite3.Connection, feature_id: int) -> list[dict]:
+    _require_feature(conn, feature_id)
+    return [
+        feature_dict(r)
+        for r in conn.execute(
+            "SELECT * FROM feature_reviews WHERE feature_id = ?"
+            " ORDER BY round",
+            (feature_id,),
+        )
+    ]
 
 
 def _transition(
@@ -364,8 +671,8 @@ def print_list(features: list[dict]) -> None:
         print("queue is empty")
         return
     print(
-        f"{'ID':<5}{'STATUS':<9}{'PRIO':<6}{'DEP':<11}{'REPO':<16}"
-        f"{'AGENT':<16}{'CREATED':<26}TITLE"
+        f"{'ID':<5}{'STATUS':<12}{'PRIO':<6}{'DEP':<11}{'REPO':<16}"
+        f"{'AGENT':<14}{'REVIEWER':<14}{'CREATED':<26}TITLE"
     )
     for f in features:
         title = f["title"]
@@ -386,8 +693,10 @@ def print_list(features: list[dict]) -> None:
             if len(dep) > 10:
                 dep = dep[:9] + "…"
         print(
-            f"{f['id']:<5}{f['status']:<9}{prio:<6}{dep:<11}{repo:<16}"
-            f"{(f['agent_id'] or '-'):<16}{f['created_at']:<26}{title}"
+            f"{f['id']:<5}{f['status']:<12}{prio:<6}{dep:<11}{repo:<16}"
+            f"{(f['agent_id'] or '-'):<14}"
+            f"{(f['reviewer_id'] or '-'):<14}"
+            f"{f['created_at']:<26}{title}"
         )
 
 
@@ -408,6 +717,30 @@ def print_feature(f: dict, header: str) -> None:
         print(f"  repo:        {f['repo']}")
     if f["agent_id"]:
         print(f"  agent:       {f['agent_id']}")
+    if f["reviewer_id"]:
+        print(f"  reviewer:    {f['reviewer_id']}")
+    if f["plan_file"]:
+        print(f"  plan file:   {f['plan_file']}")
+    if f["review_round"]:
+        print(f"  reviews:     {f['review_round']} round(s)")
+    if f["no_plan"]:
+        print(f"  no plan:     yes")
+
+
+def print_reviews(feature_id: int, reviews: list[dict]) -> None:
+    if not reviews:
+        print(f"feature #{feature_id}: no reviews yet")
+        return
+    print(f"reviews for feature #{feature_id}:")
+    for r in reviews:
+        by = f" by {r['reviewer_id']}" if r["reviewer_id"] else ""
+        print(
+            f"  round {r['round']}: {r['verdict']}{by}"
+            f" ({r['created_at']})"
+        )
+        if r["comment"]:
+            for line in r["comment"].splitlines():
+                print(f"      {line}")
 
 
 def emit(obj, as_json: bool, human) -> None:
@@ -460,6 +793,50 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="list pending and wip features",
     )
+    ops.add_argument(
+        "--claim",
+        metavar="ID",
+        type=int,
+        help="assign pending feature ID to --agent-id (marks it wip)",
+    )
+    ops.add_argument(
+        "--submit-plan",
+        metavar="ID",
+        type=int,
+        help="submit the plan of a wip feature (→ plan_review)",
+    )
+    ops.add_argument(
+        "--claim-review",
+        metavar="ID",
+        type=int,
+        help="claim the plan review of a feature for --reviewer"
+        " (→ reviewing)",
+    )
+    ops.add_argument(
+        "--unclaim-review",
+        metavar="ID",
+        type=int,
+        help="release a claimed review back to plan_review",
+    )
+    ops.add_argument(
+        "--verdict",
+        metavar="ID",
+        type=int,
+        help="record the review --outcome for a reviewing feature"
+        " (→ back to wip)",
+    )
+    ops.add_argument(
+        "--reassign",
+        metavar="ID",
+        type=int,
+        help="reassign a wip feature to --agent-id (dead owner hand-off)",
+    )
+    ops.add_argument(
+        "--reviews",
+        metavar="ID",
+        type=int,
+        help="show the review history of a feature",
+    )
     parser.add_argument(
         "--agent-id", help="identity of the calling agent (pop/done/release)"
     )
@@ -489,6 +866,34 @@ def main(argv: list[str] | None = None) -> int:
         " (repeatable for several dependencies)",
     )
     parser.add_argument(
+        "--no-plan",
+        action="store_true",
+        help="with --add: the feature skips the plan→review pipeline",
+    )
+    parser.add_argument(
+        "--reviewer",
+        metavar="SID",
+        help="reviewer session id (--claim-review/--verdict)",
+    )
+    parser.add_argument(
+        "--outcome",
+        choices=("approved", "denied", "conditional"),
+        help="verdict outcome (--verdict)",
+    )
+    parser.add_argument(
+        "--comment", default="", metavar="TEXT",
+        help="verdict comment (--verdict)",
+    )
+    parser.add_argument(
+        "--plan-file", metavar="PATH",
+        help="plan file path (required by --submit-plan)",
+    )
+    parser.add_argument(
+        "--plan-content", metavar="PATH",
+        help="file whose content is stored as the plan"
+        " (--submit-plan; falls back to reading --plan-file)",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="with --list: also show archived (done) features",
@@ -499,7 +904,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="bypass agent ownership check for --done/--release",
+        help="bypass agent/reviewer ownership checks"
+        " (--done/--release/--submit-plan/--verdict/--reassign)",
     )
     parser.add_argument(
         "--db", type=Path, help="database path (default: $AGENTBACKLOG_DB"
@@ -510,20 +916,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if (args.pop or args.done is not None) and not args.agent_id:
-        parser.error("--agent-id is required for --pop/--done")
+    needs_agent = (
+        args.pop or args.done is not None or args.claim is not None
+        or args.submit_plan is not None or args.reassign is not None
+    )
+    if needs_agent and not args.agent_id:
+        parser.error(
+            "--agent-id is required for"
+            " --pop/--done/--claim/--submit-plan/--reassign"
+        )
     if args.release is not None and not args.agent_id and not args.force:
         parser.error("--release needs --agent-id (or --force)")
     if args.all and not args.list:
         parser.error("--all only makes sense with --list")
     if args.depends_on is not None and args.add is None:
         parser.error("--depends-on only makes sense with --add")
+    if args.no_plan and args.add is None:
+        parser.error("--no-plan only makes sense with --add")
     if args.depend is not None and len(args.depend) < 2:
         parser.error("--depend needs an ID and at least one DEP (0 clears)")
+    if args.submit_plan is not None and not args.plan_file:
+        parser.error("--submit-plan requires --plan-file")
+    if (
+        args.claim_review is not None or args.verdict is not None
+    ) and not args.reviewer:
+        parser.error("--reviewer is required for --claim-review/--verdict")
+    if args.verdict is not None and args.outcome is None:
+        parser.error("--verdict requires --outcome")
     if args.repo is not None and not (
         args.add is not None or args.pop or args.list
+        or args.claim is not None
     ):
-        parser.error("--repo only makes sense with --add/--pop/--list")
+        parser.error(
+            "--repo only makes sense with --add/--pop/--list/--claim"
+        )
 
     resolved_repo = args.repo or os.environ.get("AGENTBACKLOG_REPO")
 
@@ -538,7 +964,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.add is not None:
             f = cmd_add(
                 conn, args.add, args.description, args.depends_on,
-                resolved_repo,
+                resolved_repo, args.no_plan,
             )
             emit(f, args.as_json,
                  lambda: print(f"queued feature #{f['id']}: {f['title']}"))
@@ -583,6 +1009,70 @@ def main(argv: list[str] | None = None) -> int:
                 f" {', '.join(f'#{d}' for d in sorted(set(deps)))}"
             )
             emit(f, args.as_json, lambda: print(msg))
+        elif args.claim is not None:
+            f = cmd_claim(
+                conn, args.claim, args.agent_id, resolved_repo
+            )
+            emit(
+                f, args.as_json,
+                lambda: print_feature(f, f"claimed feature #{f['id']}"),
+            )
+        elif args.submit_plan is not None:
+            f = cmd_submit_plan(
+                conn, args.submit_plan, args.agent_id, args.plan_file,
+                args.plan_content, args.force,
+            )
+            emit(
+                f, args.as_json,
+                lambda: print(
+                    f"feature #{f['id']} plan submitted → plan_review"
+                ),
+            )
+        elif args.claim_review is not None:
+            f = cmd_claim_review(conn, args.claim_review, args.reviewer)
+            emit(
+                f, args.as_json,
+                lambda: print(
+                    f"feature #{f['id']} review claimed"
+                    f" by {f['reviewer_id']}"
+                ),
+            )
+        elif args.unclaim_review is not None:
+            f = cmd_unclaim_review(conn, args.unclaim_review)
+            emit(
+                f, args.as_json,
+                lambda: print(
+                    f"feature #{f['id']} review released → plan_review"
+                ),
+            )
+        elif args.verdict is not None:
+            f = cmd_verdict(
+                conn, args.verdict, args.reviewer, args.outcome,
+                args.comment, args.force,
+            )
+            emit(
+                f, args.as_json,
+                lambda: print(
+                    f"feature #{f['id']} verdict '{args.outcome}'"
+                    " recorded → wip"
+                ),
+            )
+        elif args.reassign is not None:
+            f = cmd_reassign(
+                conn, args.reassign, args.agent_id, args.force
+            )
+            emit(
+                f, args.as_json,
+                lambda: print(
+                    f"feature #{f['id']} reassigned to {f['agent_id']}"
+                ),
+            )
+        elif args.reviews is not None:
+            rs = cmd_reviews(conn, args.reviews)
+            emit(
+                rs, args.as_json,
+                lambda: print_reviews(args.reviews, rs),
+            )
         else:  # --list
             fs = cmd_list(conn, args.all, args.repo)
             emit(fs, args.as_json, lambda: print_list(fs))
