@@ -37,6 +37,15 @@ agentbacklog --bump 4                          # pending → front of queue
 agentbacklog --depend 5 2 3                    # #5 depends on #2 AND #3 (0 clears)
 agentbacklog --list                            # pending + wip
 agentbacklog --list --all                      # include archived (done)
+
+# plan → review → implementation pipeline
+agentbacklog --claim 7 --agent-id s-planner    # assign pending #7 (deps-checked)
+agentbacklog --submit-plan 7 --agent-id s-planner --plan-file plan.md
+agentbacklog --claim-review 7 --reviewer s-rev # plan_review → reviewing
+agentbacklog --verdict 7 --reviewer s-rev --outcome approved --comment "ok"
+agentbacklog --unclaim-review 7                # reviewer died → plan_review
+agentbacklog --reassign 7 --agent-id s-new     # dead owner hand-off
+agentbacklog --reviews 7                       # verdict history
 ```
 
 | Command | Description |
@@ -47,7 +56,15 @@ agentbacklog --list --all                      # include archived (done)
 | `--done ID --agent-id A` | Mark a `wip` feature `done` (archived). Ownership-checked, `--force` overrides |
 | `--release ID --agent-id A` | Give a `wip` feature back to `pending` |
 | `--bump ID` | Move a `pending` feature to the front of the queue |
-| `--list [--all] [--repo NAME]` | List `pending`+`wip` (`--all` includes `done`), optionally filtered by repo |
+| `--list [--all] [--repo NAME]` | List non-`done` items (`--all` includes `done`), optionally filtered by repo |
+| `--claim ID --agent-id A [--repo NAME]` | Assign a **specific** `pending` feature → `wip`. Same eligibility as `--pop` (deps all done, repo scope) but no queue scan |
+| `--submit-plan ID --agent-id A --plan-file PATH [--plan-content PATH]` | `wip` → `plan_review`. Stores `plan_file`; plan content read from `--plan-content`, else `plan_file` itself, else NULL. Owner-checked |
+| `--claim-review ID --reviewer SID` | `plan_review` → `reviewing`, sets `reviewer_id`. Atomic — concurrent claims race safely |
+| `--unclaim-review ID` | `reviewing` → `plan_review`, clears `reviewer_id` (dead reviewer / timeout) |
+| `--verdict ID --reviewer SID --outcome approved\|denied\|conditional --comment TXT` | `reviewing` → `wip`, appends a `feature_reviews` row (round = current `review_round`), `review_round++`. Reviewer-checked, `--force` overrides |
+| `--reassign ID --agent-id A` | Re-point a `wip` feature to a new agent (dead owner hand-off). `--force` also covers `plan_review`/`reviewing` items |
+| `--reviews ID` | Show the `feature_reviews` history of a feature |
+| `--no-plan` | With `--add`: item skips the plan→review pipeline (`no_plan=1`) |
 | `--json` | Machine-readable output |
 | `--db PATH` | Override database path |
 | `--version` | Print version |
@@ -90,6 +107,28 @@ name, path, workspace id…). Then:
 Set `AGENTBACKLOG_REPO` in the environment to scope `--add`/`--pop` for a
 whole session without repeating the flag.
 
+### Plan → review → implementation pipeline
+
+Extended statuses let an orchestrator drive a plan-then-review flow:
+
+```
+pending → wip → plan_review → reviewing → wip → done
+```
+
+- `--claim` assigns a chosen item to a planner session (`--pop` is
+  unchanged: it only ever serves `pending` items).
+- The planner works on a plan, then `--submit-plan` sends the item to
+  `plan_review` with the plan stored in the db (`plan_content` — a
+  reviewer on another machine gets it straight from `--list --json`).
+- A reviewer `--claim-review`s it (→ `reviewing`), then `--verdict`s:
+  every round is logged in `feature_reviews` and sends the item back to
+  `wip` for implementation or plan revision (`conditional`/`denied`
+  verdict → resubmit with `--submit-plan` again).
+- `--unclaim-review` frees a review whose reviewer died;
+  `--reassign` hands a `wip` item to a new agent when its owner is gone.
+- `--add --no-plan` marks items that bypass the pipeline (ops notes,
+  urgencies).
+
 ## Agent workflow
 
 1. Choose a stable `--agent-id` for the session (session name, hostname…)
@@ -111,11 +150,14 @@ Default database: `~/.agentbacklog/backlog.db`. Override with the
 `AGENTBACKLOG_DB` environment variable or `--db PATH`.
 
 Schema: `features` (`id`, `title`, `description`,
-`status` ∈ `pending|wip|done`, `priority`, `repo`, `agent_id`,
-`created_at`, `started_at`, `done_at`) plus `feature_deps`
-(`feature_id`, `depends_on`) for dependencies. New columns/tables are
-added automatically to older databases (a legacy `depends_on` column is
-migrated into `feature_deps` then dropped).
+`status` ∈ `pending|wip|plan_review|reviewing|done`, `priority`, `repo`,
+`agent_id`, `plan_file`, `plan_content`, `reviewer_id`, `review_round`,
+`no_plan`, `created_at`, `started_at`, `done_at`) plus `feature_deps`
+(`feature_id`, `depends_on`) and `feature_reviews` (`feature_id`, `round`,
+`reviewer_id`, `verdict`, `comment`, `created_at`). Migrations run
+automatically on connect — the v0.7 status CHECK upgrade rebuilds the
+`features` table and drops a `backlog.db.bak-<ts>` backup next to the db
+first.
 
 ## Contributing
 

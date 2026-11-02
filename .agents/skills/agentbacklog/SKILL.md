@@ -1,7 +1,7 @@
 ---
 name: agentbacklog
-description: Use the AgentBacklog feature queue — shared FIFO queue between a user and dev agents (add/pop/done/release/bump/depend/list)
-argument-hint: "[add|pop|done|release|bump|depend|list] ..."
+description: Use the AgentBacklog feature queue — shared FIFO queue between a user and dev agents (add/pop/claim/done/release/bump/depend/submit-plan/claim-review/verdict/list)
+argument-hint: "[add|pop|claim|done|release|bump|depend|submit-plan|verdict|list] ..."
 allowed-tools:
   - exec
 ---
@@ -27,6 +27,13 @@ Features are enqueued, popped (FIFO, tunable via `--bump` priority and
 | `agentbacklog --release <ID> --agent-id <id>` | wip → back to pending |
 | `agentbacklog --bump <ID>` | Move a pending feature to the front |
 | `agentbacklog --depend <ID> <DEP> [DEP…]` | Set pending ID's whole dependency set — poppable once ALL are done (`0` clears) |
+| `agentbacklog --claim <ID> --agent-id <id> [--repo NAME]` | Assign a specific pending ID → wip (orchestrator-driven; same eligibility as pop) |
+| `agentbacklog --submit-plan <ID> --agent-id <id> --plan-file <path> [--plan-content <path>]` | wip → plan_review; plan content travels in the db |
+| `agentbacklog --claim-review <ID> --reviewer <sid>` | plan_review → reviewing (atomic claim) |
+| `agentbacklog --unclaim-review <ID>` | reviewing → plan_review (dead reviewer) |
+| `agentbacklog --verdict <ID> --reviewer <sid> --outcome approved\|denied\|conditional --comment "…"` | reviewing → wip; logs a review round |
+| `agentbacklog --reassign <ID> --agent-id <id>` | Re-owner a wip item (dead agent hand-off; `--force` covers review states) |
+| `agentbacklog --reviews <ID>` | Review history of an item |
 | `agentbacklog --list [--all] [--repo NAME] [--json]` | List pending+wip (`--all` includes done) |
 
 `--json` gives machine output — prefer it as an agent. `--force` bypasses
@@ -41,6 +48,14 @@ without `--repo` takes **any** eligible feature (tagged or not);
 `--pop --repo NAME` restricts to `NAME` + untagged (repo-dedicated
 session). Export `AGENTBACKLOG_REPO=<name>` to scope a whole session.
 `--workspace` is an alias of `--repo`.
+
+Pipeline `pending → wip → plan_review → reviewing → wip → done`: an
+orchestrator `--claim`s an item for a planner; the planner `--submit-plan`s
+its plan (content is stored in the db, so any reviewer reads it via
+`--list --json`); a reviewer `--claim-review`s then `--verdict`s it —
+every round is logged (`--reviews ID`) and sends the item back to `wip`
+for implementation or revision (resubmit again after a
+conditional/denied). Items added with `--add --no-plan` skip the pipeline.
 
 ## Agent protocol
 
