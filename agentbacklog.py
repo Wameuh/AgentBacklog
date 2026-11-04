@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -567,6 +567,110 @@ def cmd_reviews(conn: sqlite3.Connection, feature_id: int) -> list[dict]:
     ]
 
 
+def cmd_edit(
+    conn: sqlite3.Connection,
+    feature_id: int,
+    *,
+    title: str | None,
+    description: str | None,
+    append_desc: str | None,
+    repo_set: bool,
+    repo: str | None,
+    no_plan: bool,
+    plan: bool,
+    force: bool,
+) -> dict:
+    """Update fields of a feature (pending; --force for other statuses)."""
+    sets: list[str] = []
+    params: list = []
+    if title is not None:
+        sets.append("title = ?")
+        params.append(title)
+    if description is not None:
+        sets.append("description = ?")
+        params.append(description)
+    if append_desc is not None:
+        sets.append("description = description || ?")
+        params.append(append_desc)
+    if repo_set:
+        sets.append("repo = ?")
+        params.append(repo)
+    if no_plan:
+        sets.append("no_plan = 1")
+    if plan:
+        sets.append("no_plan = 0")
+    if not sets:
+        raise BacklogError(
+            "nothing to update — pass --title/--desc/--desc-file/"
+            "--append-desc/--append-desc-file/--repo/--no-plan/--plan"
+        )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if row["status"] != "pending" and not force:
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}, not pending"
+                " (use --force)"
+            )
+        params.append(feature_id)
+        conn.execute(
+            f"UPDATE features SET {', '.join(sets)} WHERE id = ?", params
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _get_feature(conn, feature_id)
+
+
+def cmd_rm(conn: sqlite3.Connection, feature_id: int, force: bool) -> int:
+    """Delete a feature plus its dep edges and review history.
+
+    Refuses on active statuses or when other features depend on it,
+    unless --force — the dependents' edges are then dropped, which
+    unblocks them. Returns the number of dependents that were detached.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _require_feature(conn, feature_id)
+        if (
+            row["status"] in ("wip", "plan_review", "reviewing")
+            and not force
+        ):
+            raise BacklogError(
+                f"feature {feature_id} is {row['status']}"
+                " (use --force to delete)"
+            )
+        dependents = [
+            r["feature_id"]
+            for r in conn.execute(
+                "SELECT feature_id FROM feature_deps WHERE depends_on = ?",
+                (feature_id,),
+            )
+        ]
+        if dependents and not force:
+            raise BacklogError(
+                f"feature {feature_id} is depended on by "
+                f"{', '.join(f'#{d}' for d in sorted(dependents))}"
+                " (use --force — their dep edges will be removed)"
+            )
+        conn.execute(
+            "DELETE FROM feature_deps"
+            " WHERE feature_id = ? OR depends_on = ?",
+            (feature_id, feature_id),
+        )
+        conn.execute(
+            "DELETE FROM feature_reviews WHERE feature_id = ?",
+            (feature_id,),
+        )
+        conn.execute("DELETE FROM features WHERE id = ?", (feature_id,))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return len(dependents)
+
+
 def _transition(
     conn: sqlite3.Connection,
     feature_id: int,
@@ -727,6 +831,13 @@ def print_feature(f: dict, header: str) -> None:
         print(f"  no plan:     yes")
 
 
+def _read_desc_file(path: str) -> str:
+    try:
+        return Path(path).expanduser().read_text()
+    except OSError as e:
+        raise BacklogError(f"cannot read {path}: {e}") from e
+
+
 def print_reviews(feature_id: int, reviews: list[dict]) -> None:
     if not reviews:
         print(f"feature #{feature_id}: no reviews yet")
@@ -837,6 +948,23 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="show the review history of a feature",
     )
+    ops.add_argument(
+        "--edit",
+        metavar="ID",
+        type=int,
+        help="update fields of a pending feature (--title/--desc/"
+        "--desc-file/--append-desc/--append-desc-file/--repo/"
+        "--no-plan/--plan; --force for other statuses)",
+    )
+    ops.add_argument(
+        "--rm",
+        "--delete",
+        dest="rm",
+        metavar="ID",
+        type=int,
+        help="delete a feature (pending/done; --force for active"
+        " states or when other features depend on it)",
+    )
     parser.add_argument(
         "--agent-id", help="identity of the calling agent (pop/done/release)"
     )
@@ -844,8 +972,34 @@ def main(argv: list[str] | None = None) -> int:
         "--desc",
         "--description",
         dest="description",
-        default="",
-        help="longer description for --add",
+        help="with --add: longer description;"
+        " with --edit: replace the description",
+    )
+    parser.add_argument(
+        "--title",
+        metavar="TITLE",
+        help="with --edit: new title",
+    )
+    parser.add_argument(
+        "--desc-file",
+        metavar="PATH",
+        help="with --add/--edit: read the description from a file",
+    )
+    parser.add_argument(
+        "--append-desc",
+        metavar="TEXT",
+        help="with --edit: append text to the description",
+    )
+    parser.add_argument(
+        "--append-desc-file",
+        metavar="PATH",
+        help="with --edit: append a file's content to the description",
+    )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="with --edit: require the plan→review pipeline"
+        " (clears no_plan)",
     )
     parser.add_argument(
         "--repo",
@@ -854,7 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME",
         help="with --add: tag the feature for a repo/workspace;"
         " with --pop: restrict to features for it (plus untagged);"
-        " without it, pop takes anything; with --list: filter."
+        " without it, pop takes anything; with --list: filter;"
+        " with --edit: set the tag ('-' clears it)."
         " Default: $AGENTBACKLOG_REPO",
     )
     parser.add_argument(
@@ -868,7 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-plan",
         action="store_true",
-        help="with --add: the feature skips the plan→review pipeline",
+        help="with --add/--edit: the feature skips the plan→review"
+        " pipeline",
     )
     parser.add_argument(
         "--reviewer",
@@ -904,8 +1060,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="bypass agent/reviewer ownership checks"
-        " (--done/--release/--submit-plan/--verdict/--reassign)",
+        help="bypass agent/reviewer ownership and status checks"
+        " (--done/--release/--submit-plan/--verdict/--reassign/"
+        "--edit/--rm)",
     )
     parser.add_argument(
         "--db", type=Path, help="database path (default: $AGENTBACKLOG_DB"
@@ -931,8 +1088,24 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--all only makes sense with --list")
     if args.depends_on is not None and args.add is None:
         parser.error("--depends-on only makes sense with --add")
-    if args.no_plan and args.add is None:
-        parser.error("--no-plan only makes sense with --add")
+    if args.no_plan and args.add is None and args.edit is None:
+        parser.error("--no-plan only makes sense with --add/--edit")
+    if args.no_plan and args.plan:
+        parser.error("--no-plan and --plan are mutually exclusive")
+    if args.title is not None and args.edit is None:
+        parser.error("--title only makes sense with --edit")
+    if (
+        args.description is not None or args.desc_file is not None
+    ) and args.add is None and args.edit is None:
+        parser.error("--desc/--desc-file only make sense with --add/--edit")
+    if args.description is not None and args.desc_file is not None:
+        parser.error("--desc and --desc-file are mutually exclusive")
+    if args.append_desc is not None and args.edit is None:
+        parser.error("--append-desc only makes sense with --edit")
+    if args.append_desc_file is not None and args.edit is None:
+        parser.error("--append-desc-file only makes sense with --edit")
+    if args.plan and args.edit is None:
+        parser.error("--plan only makes sense with --edit")
     if args.depend is not None and len(args.depend) < 2:
         parser.error("--depend needs an ID and at least one DEP (0 clears)")
     if args.submit_plan is not None and not args.plan_file:
@@ -945,10 +1118,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--verdict requires --outcome")
     if args.repo is not None and not (
         args.add is not None or args.pop or args.list
-        or args.claim is not None
+        or args.claim is not None or args.edit is not None
     ):
         parser.error(
-            "--repo only makes sense with --add/--pop/--list/--claim"
+            "--repo only makes sense with --add/--pop/--list/--claim/--edit"
         )
 
     resolved_repo = args.repo or os.environ.get("AGENTBACKLOG_REPO")
@@ -962,8 +1135,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.add is not None:
+            desc = args.description
+            if desc is None and args.desc_file:
+                desc = _read_desc_file(args.desc_file)
             f = cmd_add(
-                conn, args.add, args.description, args.depends_on,
+                conn, args.add, desc or "", args.depends_on,
                 resolved_repo, args.no_plan,
             )
             emit(f, args.as_json,
@@ -1072,6 +1248,36 @@ def main(argv: list[str] | None = None) -> int:
             emit(
                 rs, args.as_json,
                 lambda: print_reviews(args.reviews, rs),
+            )
+        elif args.edit is not None:
+            desc = args.description
+            if desc is None and args.desc_file:
+                desc = _read_desc_file(args.desc_file)
+            append = args.append_desc or ""
+            if args.append_desc_file:
+                append += _read_desc_file(args.append_desc_file)
+            f = cmd_edit(
+                conn, args.edit,
+                title=args.title, description=desc,
+                append_desc=append or None,
+                repo_set=args.repo is not None,
+                repo=None if args.repo == "-" else args.repo,
+                no_plan=args.no_plan, plan=args.plan, force=args.force,
+            )
+            emit(
+                f, args.as_json,
+                lambda: print_feature(f, f"updated feature #{f['id']}"),
+            )
+        elif args.rm is not None:
+            detached = cmd_rm(conn, args.rm, args.force)
+            msg = f"feature #{args.rm} deleted"
+            if detached:
+                msg += (
+                    f" ({detached} dependent dep edge(s) removed)"
+                )
+            emit(
+                {"id": args.rm, "deleted": True}, args.as_json,
+                lambda: print(msg),
             )
         else:  # --list
             fs = cmd_list(conn, args.all, args.repo)

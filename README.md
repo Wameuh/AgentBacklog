@@ -46,6 +46,13 @@ agentbacklog --verdict 7 --reviewer s-rev --outcome approved --comment "ok"
 agentbacklog --unclaim-review 7                # reviewer died → plan_review
 agentbacklog --reassign 7 --agent-id s-new     # dead owner hand-off
 agentbacklog --reviews 7                       # verdict history
+
+# update / delete
+agentbacklog --edit 7 --title "New title" --append-desc "extra notes"
+agentbacklog --edit 7 --repo AgentControl      # retag ('-' clears the tag)
+agentbacklog --edit 7 --no-plan                # toggle pipeline opt-out
+agentbacklog --rm 7                            # delete (pending/done only)
+agentbacklog --rm 7 --force                    # also detaches dependents
 ```
 
 | Command | Description |
@@ -64,6 +71,8 @@ agentbacklog --reviews 7                       # verdict history
 | `--verdict ID --reviewer SID --outcome approved\|denied\|conditional --comment TXT` | `reviewing` → `wip`, appends a `feature_reviews` row (round = current `review_round`), `review_round++`. Reviewer-checked, `--force` overrides |
 | `--reassign ID --agent-id A` | Re-point a `wip` feature to a new agent (dead owner hand-off). `--force` also covers `plan_review`/`reviewing` items |
 | `--reviews ID` | Show the `feature_reviews` history of a feature |
+| `--edit ID [fields]` | Update a `pending` feature: `--title`, `--desc`/`--desc-file` (replace description), `--append-desc`/`--append-desc-file` (append), `--repo NAME` (`-` clears), `--no-plan`/`--plan`. `--force` for other statuses |
+| `--rm ID` (`--delete`) | Delete a feature plus its dep edges and review history. `pending`/`done` only; `--force` also covers active states and detaches any dependents (unblocking them) |
 | `--no-plan` | With `--add`: item skips the plan→review pipeline (`no_plan=1`) |
 | `--json` | Machine-readable output |
 | `--db PATH` | Override database path |
