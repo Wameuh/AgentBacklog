@@ -34,6 +34,8 @@ Features are enqueued, popped (FIFO, tunable via `--bump` priority and
 | `agentbacklog --verdict <ID> --reviewer <sid> --outcome approved\|denied\|conditional --comment "…"` | reviewing → wip; logs a review round |
 | `agentbacklog --reassign <ID> --agent-id <id>` | Re-owner a wip item (dead agent hand-off; `--force` covers review states) |
 | `agentbacklog --reviews <ID>` | Review history of an item |
+| `agentbacklog --edit <ID> [--title T] [--desc TXT|--desc-file F] [--append-desc TXT|--append-desc-file F] [--repo NAME] [--no-plan\|--plan]` | Update a pending item's fields (`--repo -` clears the tag; `--force` for other statuses) |
+| `agentbacklog --rm <ID>` | Delete an item (pending/done; `--force` for active states or to detach dependents) |
 | `agentbacklog --list [--all] [--repo NAME] [--json]` | List pending+wip (`--all` includes done) |
 
 `--json` gives machine output — prefer it as an agent. `--force` bypasses
