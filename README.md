@@ -59,7 +59,7 @@ agentbacklog --rm 7 --force                    # also detaches dependents
 |---|---|
 | `--add TITLE [--desc TXT] [--depends-on ID]… [--repo NAME]` | Enqueue a feature (→ `pending`), optionally dep-blocked (repeat `--depends-on`) and/or repo-scoped |
 | `--depend ID DEP [DEP…]` | Set `pending` feature `ID`'s dependencies — poppable once **all** are done (`0` clears all). Rejects self-deps, cycles, non-pending items |
-| `--pop --agent-id A [--repo NAME]` | Take the highest-priority/oldest eligible `pending` → `wip`; `--repo` restricts to that repo + untagged |
+| `--pop --agent-id A [--repo NAME]` | Take the highest-priority/oldest eligible `pending` → `wip`; `--repo` restricts to that repo + untagged. **Legacy path**: ignores the per-item dispatch spec (`agent`/`model`/`effort`/`mode`) — the normal dispatch is the orchestrator's `--claim`, which honours it |
 | `--done ID --agent-id A` | Mark a `wip` feature `done` (archived). Ownership-checked, `--force` overrides |
 | `--release ID --agent-id A` | Give a `wip` feature back to `pending` |
 | `--bump ID` | Move a `pending` feature to the front of the queue |
@@ -71,9 +71,11 @@ agentbacklog --rm 7 --force                    # also detaches dependents
 | `--verdict ID --reviewer SID --outcome approved\|denied\|conditional --comment TXT` | `reviewing` → `wip`, appends a `feature_reviews` row (round = current `review_round`), `review_round++`. Reviewer-checked, `--force` overrides |
 | `--reassign ID --agent-id A` | Re-point a `wip` feature to a new agent (dead owner hand-off). `--force` also covers `plan_review`/`reviewing` items |
 | `--reviews ID` | Show the `feature_reviews` history of a feature |
-| `--edit ID [fields]` | Update a `pending` feature: `--title`, `--desc`/`--desc-file` (replace description), `--append-desc`/`--append-desc-file` (append), `--repo NAME` (`-` clears), `--no-plan`/`--plan`. `--force` for other statuses |
+| `--edit ID [fields]` | Update a `pending` feature: `--title`, `--desc`/`--desc-file` (replace description), `--append-desc`/`--append-desc-file` (append), `--repo NAME` (`-` clears), `--no-plan`/`--plan`, `--agent`/`--model`/`--effort`/`--mode`/`--done-when` (`-` clears a spec field / resets `done_when`). `--force` for other statuses |
 | `--rm ID` (`--delete`) | Delete a feature plus its dep edges and review history. `pending`/`done` only; `--force` also covers active states and detaches any dependents (unblocking them) |
 | `--no-plan` | With `--add`: item skips the plan→review pipeline (`no_plan=1`) |
+| `--agent PROFILE` `--model M` `--effort L` `--mode M` | With `--add`/`--edit`: per-item dispatch spec — required `[agents.*]` profile and spawn overrides (item > pool entry > role config). All NULL/empty = no constraint |
+| `--done-when RULE` | With `--add`/`--edit`: definition of done — `pr_merged` (default: `--done` once the item's PR is merged) or `deliverable` (`--done` once the item's own criteria are met, no merge wait). Free-form text, not gated |
 | `--json` | Machine-readable output |
 | `--db PATH` | Override database path |
 | `--version` | Print version |
@@ -137,6 +139,28 @@ pending → wip → plan_review → reviewing → wip → done
   `--reassign` hands a `wip` item to a new agent when its owner is gone.
 - `--add --no-plan` marks items that bypass the pipeline (ops notes,
   urgencies).
+
+### Per-item dispatch spec & definition of done
+
+An item can carry an execution spec (`--agent`, `--model`, `--effort`,
+`--mode` — all optional, empty = no constraint) and a done contract
+(`--done-when`). They are exposed by `--list --json` and consumed by
+the orchestrator's dispatch (`--claim` path):
+
+- `agent` requires a specific `[agents.*]` profile — the orchestrator
+  only spawns the item on a matching pool entry; an item whose spec
+  has no compatible free slot waits (visible in the component status)
+  without blocking the items behind it. In plan→review mode the spec
+  applies to both planner and implementer; plan reviewers stay on
+  `reviewer_agent`.
+- `model`/`effort`/`mode` override the pool entry / role values at
+  spawn (item > pool entry > role config).
+- `done_when` is a free-form text contract: `pr_merged` (default) =
+  `--done` once the item's PR is merged; `deliverable` = `--done` once
+  the item's own criteria are met, never waiting for a merge. The
+  orchestrator substitutes the matching rule into worker prompts.
+- `--pop` (legacy self-serve path) ignores the spec — use `--claim`
+  dispatch for spec'd items.
 
 ## Agent workflow
 

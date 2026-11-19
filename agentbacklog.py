@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -37,6 +37,11 @@ FEATURES_DEF = """\
     reviewer_id TEXT,
     review_round INTEGER NOT NULL DEFAULT 0,
     no_plan     INTEGER NOT NULL DEFAULT 0,
+    agent       TEXT,
+    model       TEXT,
+    effort      TEXT,
+    mode        TEXT,
+    done_when   TEXT NOT NULL DEFAULT 'pr_merged',
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at  TEXT,
     done_at     TEXT"""
@@ -45,7 +50,8 @@ FEATURES_DEF = """\
 FEATURE_COLUMNS = [
     "id", "title", "description", "status", "priority", "repo",
     "agent_id", "plan_file", "plan_content", "reviewer_id",
-    "review_round", "no_plan", "created_at", "started_at", "done_at",
+    "review_round", "no_plan", "agent", "model", "effort", "mode",
+    "done_when", "created_at", "started_at", "done_at",
 ]
 
 SCHEMA = f"""\
@@ -98,6 +104,18 @@ def connect(path: Path) -> sqlite3.Connection:
         )
     if "repo" not in cols:
         conn.execute("ALTER TABLE features ADD COLUMN repo TEXT")
+    # v0.9: per-item dispatch spec (agent/model/effort/mode, all NULL =
+    # no constraint) + definition of done (text enum, extensible).
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+    for col, ddl in (
+        ("agent", "TEXT"),
+        ("model", "TEXT"),
+        ("effort", "TEXT"),
+        ("mode", "TEXT"),
+        ("done_when", "TEXT NOT NULL DEFAULT 'pr_merged'"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE features ADD COLUMN {col} {ddl}")
     if "depends_on" in cols:
         conn.execute(
             "INSERT OR IGNORE INTO feature_deps (feature_id, depends_on)"
@@ -216,6 +234,12 @@ def _would_cycle(
     return False
 
 
+# Per-item dispatch spec columns — all NULL = no constraint. The
+# orchestrator matches `agent` against worker_pool profiles and lets
+# model/effort/mode override the pool entry / role values at spawn.
+SPEC_COLUMNS = ("agent", "model", "effort", "mode")
+
+
 def cmd_add(
     conn: sqlite3.Connection,
     title: str,
@@ -223,14 +247,25 @@ def cmd_add(
     depends_on: list[int] | None,
     repo: str | None,
     no_plan: bool,
+    spec: dict | None,
+    done_when: str | None,
 ) -> dict:
     deps = set(depends_on or [])
     for dep in deps:
         _require_feature(conn, dep)
+    spec = spec or {}
     cur = conn.execute(
-        "INSERT INTO features (title, description, repo, no_plan)"
-        " VALUES (?, ?, ?, ?)",
-        (title, description, repo, int(no_plan)),
+        "INSERT INTO features (title, description, repo, no_plan,"
+        " agent, model, effort, mode, done_when)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            title,
+            description,
+            repo,
+            int(no_plan),
+            *(spec.get(c) for c in SPEC_COLUMNS),
+            done_when or "pr_merged",
+        ),
     )
     fid = cur.lastrowid
     for dep in deps:
@@ -579,8 +614,15 @@ def cmd_edit(
     no_plan: bool,
     plan: bool,
     force: bool,
+    spec: dict | None,
+    done_when: str | None,
 ) -> dict:
-    """Update fields of a feature (pending; --force for other statuses)."""
+    """Update fields of a feature (pending; --force for other statuses).
+
+    `spec` maps SPEC_COLUMNS → new value or None (clear the constraint);
+    a column absent from the dict is left untouched. `done_when=None`
+    leaves it alone, "-" resets to the 'pr_merged' default.
+    """
     sets: list[str] = []
     params: list = []
     if title is not None:
@@ -599,10 +641,18 @@ def cmd_edit(
         sets.append("no_plan = 1")
     if plan:
         sets.append("no_plan = 0")
+    for col in SPEC_COLUMNS:
+        if spec is not None and col in spec:
+            sets.append(f"{col} = ?")
+            params.append(spec[col])
+    if done_when is not None:
+        sets.append("done_when = ?")
+        params.append("pr_merged" if done_when == "-" else done_when)
     if not sets:
         raise BacklogError(
             "nothing to update — pass --title/--desc/--desc-file/"
-            "--append-desc/--append-desc-file/--repo/--no-plan/--plan"
+            "--append-desc/--append-desc-file/--repo/--no-plan/--plan/"
+            "--agent/--model/--effort/--mode/--done-when"
         )
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -829,6 +879,11 @@ def print_feature(f: dict, header: str) -> None:
         print(f"  reviews:     {f['review_round']} round(s)")
     if f["no_plan"]:
         print(f"  no plan:     yes")
+    for col in SPEC_COLUMNS:
+        if f.get(col):
+            print(f"  {col + ':':<12} {f[col]}")
+    if f.get("done_when") and f["done_when"] != "pr_merged":
+        print(f"  done when:   {f['done_when']}")
 
 
 def _read_desc_file(path: str) -> str:
@@ -871,7 +926,10 @@ def main(argv: list[str] | None = None) -> int:
     ops.add_argument(
         "--pop",
         action="store_true",
-        help="take the oldest pending feature as --agent-id (marks it wip)",
+        help="take the oldest pending feature as --agent-id (marks it"
+        " wip) — legacy path: ignores the item dispatch spec"
+        " (agent/model/effort/mode); the normal dispatch is the"
+        " orchestrator's --claim",
     )
     ops.add_argument(
         "--done",
@@ -1027,6 +1085,39 @@ def main(argv: list[str] | None = None) -> int:
         " pipeline",
     )
     parser.add_argument(
+        "--agent",
+        metavar="PROFILE",
+        help="with --add/--edit: require an [agents.*] profile for this"
+        " item (orchestrator dispatch); '-' clears the constraint"
+        " (--edit only)",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="with --add/--edit: model override at spawn (item > pool"
+        " entry > role cfg); '-' clears (--edit only)",
+    )
+    parser.add_argument(
+        "--effort",
+        metavar="LEVEL",
+        help="with --add/--edit: effort/thought_level override at spawn;"
+        " '-' clears (--edit only)",
+    )
+    parser.add_argument(
+        "--mode",
+        metavar="MODE",
+        help="with --add/--edit: session mode override at spawn;"
+        " '-' clears (--edit only)",
+    )
+    parser.add_argument(
+        "--done-when",
+        metavar="RULE",
+        help="with --add/--edit: definition of done — 'pr_merged'"
+        " (default: --done when the item's PR is merged) or"
+        " 'deliverable' (--done once the item's own criteria are"
+        " met); '-' resets to 'pr_merged' (--edit only)",
+    )
+    parser.add_argument(
         "--reviewer",
         metavar="SID",
         help="reviewer session id (--claim-review/--verdict)",
@@ -1123,6 +1214,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--repo only makes sense with --add/--pop/--list/--claim/--edit"
         )
+    spec_args = ("agent", "model", "effort", "mode", "done_when")
+    if any(getattr(args, a) is not None for a in spec_args) and not (
+        args.add is not None or args.edit is not None
+    ):
+        parser.error(
+            "--agent/--model/--effort/--mode/--done-when only make"
+            " sense with --add/--edit"
+        )
+    if args.add is not None and any(
+        getattr(args, a) == "-" for a in spec_args
+    ):
+        parser.error("'-' clearing only makes sense with --edit")
+    # Dispatch spec: "-" clears a constraint to NULL (--edit only —
+    # validated above for --add). done_when "-" resets to the default.
+    spec = {
+        c: (None if getattr(args, c) == "-" else getattr(args, c))
+        for c in SPEC_COLUMNS
+        if getattr(args, c) is not None
+    }
 
     resolved_repo = args.repo or os.environ.get("AGENTBACKLOG_REPO")
 
@@ -1140,7 +1250,8 @@ def main(argv: list[str] | None = None) -> int:
                 desc = _read_desc_file(args.desc_file)
             f = cmd_add(
                 conn, args.add, desc or "", args.depends_on,
-                resolved_repo, args.no_plan,
+                resolved_repo, args.no_plan, spec or None,
+                args.done_when,
             )
             emit(f, args.as_json,
                  lambda: print(f"queued feature #{f['id']}: {f['title']}"))
@@ -1263,6 +1374,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_set=args.repo is not None,
                 repo=None if args.repo == "-" else args.repo,
                 no_plan=args.no_plan, plan=args.plan, force=args.force,
+                spec=spec or None, done_when=args.done_when,
             )
             emit(
                 f, args.as_json,
