@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 DEFAULT_DB = Path.home() / ".agentbacklog" / "backlog.db"
 BUSY_TIMEOUT_MS = 10_000
@@ -37,6 +37,11 @@ FEATURES_DEF = """\
     reviewer_id TEXT,
     review_round INTEGER NOT NULL DEFAULT 0,
     no_plan     INTEGER NOT NULL DEFAULT 0,
+    agent       TEXT,
+    model       TEXT,
+    effort      TEXT,
+    mode        TEXT,
+    done_when   TEXT NOT NULL DEFAULT 'pr_merged',
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at  TEXT,
     done_at     TEXT"""
@@ -45,7 +50,8 @@ FEATURES_DEF = """\
 FEATURE_COLUMNS = [
     "id", "title", "description", "status", "priority", "repo",
     "agent_id", "plan_file", "plan_content", "reviewer_id",
-    "review_round", "no_plan", "created_at", "started_at", "done_at",
+    "review_round", "no_plan", "agent", "model", "effort", "mode",
+    "done_when", "created_at", "started_at", "done_at",
 ]
 
 SCHEMA = f"""\
@@ -108,6 +114,18 @@ def connect(path: Path) -> sqlite3.Connection:
             conn.execute("ALTER TABLE features DROP COLUMN depends_on")
         except sqlite3.Error:
             pass  # sqlite < 3.35: column stays but is unused
+    # v0.9: dispatch metadata for the orchestrator — plain columns,
+    # ALTER TABLE suffices (no CHECK involved).
+    for col in ("agent", "model", "effort", "mode"):
+        if col not in cols:
+            conn.execute(
+                f"ALTER TABLE features ADD COLUMN {col} TEXT"
+            )
+    if "done_when" not in cols:
+        conn.execute(
+            "ALTER TABLE features ADD COLUMN done_when"
+            " TEXT NOT NULL DEFAULT 'pr_merged'"
+        )
     # v0.7: the status CHECK is baked into the table definition, so adding
     # plan_review/reviewing (and the plan columns) needs a rebuild.
     table_sql = conn.execute(
@@ -223,14 +241,23 @@ def cmd_add(
     depends_on: list[int] | None,
     repo: str | None,
     no_plan: bool,
+    agent: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    mode: str | None = None,
+    done_when: str | None = None,
 ) -> dict:
     deps = set(depends_on or [])
     for dep in deps:
         _require_feature(conn, dep)
     cur = conn.execute(
-        "INSERT INTO features (title, description, repo, no_plan)"
-        " VALUES (?, ?, ?, ?)",
-        (title, description, repo, int(no_plan)),
+        "INSERT INTO features (title, description, repo, no_plan,"
+        " agent, model, effort, mode, done_when)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            title, description, repo, int(no_plan),
+            agent, model, effort, mode, done_when or "pr_merged",
+        ),
     )
     fid = cur.lastrowid
     for dep in deps:
@@ -245,6 +272,12 @@ def cmd_add(
 def cmd_pop(
     conn: sqlite3.Connection, agent_id: str, repo: str | None
 ) -> tuple[dict | None, int]:
+    """Take the oldest eligible pending feature (→ wip).
+
+    Dispatch metadata (agent/model/effort/mode/done_when) is ignored
+    here on purpose: matching items to an agent pool is the
+    orchestrator's contract, not the queue's.
+    """
     try:
         conn.execute("BEGIN IMMEDIATE")
         scope = (
@@ -578,7 +611,16 @@ def cmd_edit(
     repo: str | None,
     no_plan: bool,
     plan: bool,
-    force: bool,
+    agent_set: bool = False,
+    agent: str | None = None,
+    model_set: bool = False,
+    model: str | None = None,
+    effort_set: bool = False,
+    effort: str | None = None,
+    mode_set: bool = False,
+    mode: str | None = None,
+    done_when: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Update fields of a feature (pending; --force for other statuses)."""
     sets: list[str] = []
@@ -599,10 +641,26 @@ def cmd_edit(
         sets.append("no_plan = 1")
     if plan:
         sets.append("no_plan = 0")
+    if agent_set:
+        sets.append("agent = ?")
+        params.append(agent)
+    if model_set:
+        sets.append("model = ?")
+        params.append(model)
+    if effort_set:
+        sets.append("effort = ?")
+        params.append(effort)
+    if mode_set:
+        sets.append("mode = ?")
+        params.append(mode)
+    if done_when is not None:
+        sets.append("done_when = ?")
+        params.append(done_when)
     if not sets:
         raise BacklogError(
             "nothing to update — pass --title/--desc/--desc-file/"
-            "--append-desc/--append-desc-file/--repo/--no-plan/--plan"
+            "--append-desc/--append-desc-file/--repo/--no-plan/--plan/"
+            "--agent/--model/--effort/--mode/--done-when"
         )
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -829,6 +887,15 @@ def print_feature(f: dict, header: str) -> None:
         print(f"  reviews:     {f['review_round']} round(s)")
     if f["no_plan"]:
         print(f"  no plan:     yes")
+    dispatch = " ".join(
+        f"{k}={f[k]}"
+        for k in ("agent", "model", "effort", "mode")
+        if f[k]
+    )
+    if dispatch:
+        print(f"  dispatch:    {dispatch}")
+    if f["done_when"] != "pr_merged":
+        print(f"  done when:   {f['done_when']}")
 
 
 def _read_desc_file(path: str) -> str:
@@ -1002,6 +1069,36 @@ def main(argv: list[str] | None = None) -> int:
         " (clears no_plan)",
     )
     parser.add_argument(
+        "--agent",
+        metavar="PROFILE",
+        help="with --add/--edit: required agent profile — dispatch"
+        " contract for the orchestrator ('-' clears on --edit)",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="with --add/--edit: model override for the spawned"
+        " session ('-' clears on --edit)",
+    )
+    parser.add_argument(
+        "--effort",
+        metavar="LEVEL",
+        help="with --add/--edit: effort/thinking override"
+        " ('-' clears on --edit)",
+    )
+    parser.add_argument(
+        "--mode",
+        metavar="MODE",
+        help="with --add/--edit: session mode override"
+        " ('-' clears on --edit)",
+    )
+    parser.add_argument(
+        "--done-when",
+        metavar="CRITERIA",
+        help="with --add/--edit: definition-of-done contract —"
+        " 'pr_merged' (default) or e.g. 'deliverable' (free text)",
+    )
+    parser.add_argument(
         "--repo",
         "--workspace",
         dest="repo",
@@ -1106,6 +1203,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--append-desc-file only makes sense with --edit")
     if args.plan and args.edit is None:
         parser.error("--plan only makes sense with --edit")
+    if (
+        args.agent is not None or args.model is not None
+        or args.effort is not None or args.mode is not None
+        or args.done_when is not None
+    ) and args.add is None and args.edit is None:
+        parser.error(
+            "--agent/--model/--effort/--mode/--done-when only make"
+            " sense with --add/--edit"
+        )
     if args.depend is not None and len(args.depend) < 2:
         parser.error("--depend needs an ID and at least one DEP (0 clears)")
     if args.submit_plan is not None and not args.plan_file:
@@ -1140,7 +1246,8 @@ def main(argv: list[str] | None = None) -> int:
                 desc = _read_desc_file(args.desc_file)
             f = cmd_add(
                 conn, args.add, desc or "", args.depends_on,
-                resolved_repo, args.no_plan,
+                resolved_repo, args.no_plan, args.agent, args.model,
+                args.effort, args.mode, args.done_when,
             )
             emit(f, args.as_json,
                  lambda: print(f"queued feature #{f['id']}: {f['title']}"))
@@ -1262,7 +1369,17 @@ def main(argv: list[str] | None = None) -> int:
                 append_desc=append or None,
                 repo_set=args.repo is not None,
                 repo=None if args.repo == "-" else args.repo,
-                no_plan=args.no_plan, plan=args.plan, force=args.force,
+                no_plan=args.no_plan, plan=args.plan,
+                agent_set=args.agent is not None,
+                agent=None if args.agent == "-" else args.agent,
+                model_set=args.model is not None,
+                model=None if args.model == "-" else args.model,
+                effort_set=args.effort is not None,
+                effort=None if args.effort == "-" else args.effort,
+                mode_set=args.mode is not None,
+                mode=None if args.mode == "-" else args.mode,
+                done_when=args.done_when,
+                force=args.force,
             )
             emit(
                 f, args.as_json,

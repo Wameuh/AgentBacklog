@@ -47,6 +47,11 @@ agentbacklog --unclaim-review 7                # reviewer died → plan_review
 agentbacklog --reassign 7 --agent-id s-new     # dead owner hand-off
 agentbacklog --reviews 7                       # verdict history
 
+# dispatch metadata (orchestrator contract)
+agentbacklog --add "Fix" --agent claude --model opus --effort high \
+    --mode smart --done-when deliverable
+agentbacklog --edit 7 --agent devin --model -   # '-' clears the field
+
 # update / delete
 agentbacklog --edit 7 --title "New title" --append-desc "extra notes"
 agentbacklog --edit 7 --repo AgentControl      # retag ('-' clears the tag)
@@ -74,6 +79,7 @@ agentbacklog --rm 7 --force                    # also detaches dependents
 | `--edit ID [fields]` | Update a `pending` feature: `--title`, `--desc`/`--desc-file` (replace description), `--append-desc`/`--append-desc-file` (append), `--repo NAME` (`-` clears), `--no-plan`/`--plan`. `--force` for other statuses |
 | `--rm ID` (`--delete`) | Delete a feature plus its dep edges and review history. `pending`/`done` only; `--force` also covers active states and detaches any dependents (unblocking them) |
 | `--no-plan` | With `--add`: item skips the plan→review pipeline (`no_plan=1`) |
+| `--agent/--model/--effort/--mode/--done-when` | With `--add`/`--edit`: dispatch metadata for the orchestrator — required agent profile, model/effort/mode overrides, done criteria (default `pr_merged`; free text). `-` clears on `--edit` |
 | `--json` | Machine-readable output |
 | `--db PATH` | Override database path |
 | `--version` | Print version |
@@ -138,6 +144,15 @@ pending → wip → plan_review → reviewing → wip → done
 - `--add --no-plan` marks items that bypass the pipeline (ops notes,
   urgencies).
 
+### Dispatch metadata
+
+Items can carry an orchestrator dispatch contract: `agent` (required
+profile), `model`, `effort`, `mode` and `done_when` (definition-of-done:
+`pr_merged` by default, or e.g. `deliverable` when no PR is expected —
+free text, the CLI does not gate values). Matching items to an agent
+pool happens **daemon-side** — `--pop`/`--claim`/`--done` ignore the
+spec entirely; it is exposed read-only via `--list --json`.
+
 ## Agent workflow
 
 1. Choose a stable `--agent-id` for the session (session name, hostname…)
@@ -161,7 +176,8 @@ Default database: `~/.agentbacklog/backlog.db`. Override with the
 Schema: `features` (`id`, `title`, `description`,
 `status` ∈ `pending|wip|plan_review|reviewing|done`, `priority`, `repo`,
 `agent_id`, `plan_file`, `plan_content`, `reviewer_id`, `review_round`,
-`no_plan`, `created_at`, `started_at`, `done_at`) plus `feature_deps`
+`no_plan`, `agent`, `model`, `effort`, `mode`, `done_when`,
+`created_at`, `started_at`, `done_at`) plus `feature_deps`
 (`feature_id`, `depends_on`) and `feature_reviews` (`feature_id`, `round`,
 `reviewer_id`, `verdict`, `comment`, `created_at`). Migrations run
 automatically on connect — the v0.7 status CHECK upgrade rebuilds the

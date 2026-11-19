@@ -21,7 +21,7 @@ Features are enqueued, popped (FIFO, tunable via `--bump` priority and
 
 | Command | Role |
 |---|---|
-| `agentbacklog --add "Title" [--desc "..."] [--depends-on ID]… [--repo NAME]` | Enqueue a feature (→ pending), optionally dep-blocked (`--depends-on` repeatable) and/or repo-scoped |
+| `agentbacklog --add "Title" [--desc "..."] [--depends-on ID]… [--repo NAME] [--agent P] [--model M] [--effort L] [--mode M] [--done-when C]` | Enqueue a feature (→ pending), optionally dep-blocked, repo-scoped and/or carrying dispatch metadata |
 | `agentbacklog --pop --agent-id <id> [--repo NAME] [--json]` | Take the highest-priority/oldest eligible pending → wip; `--repo` restricts to NAME + untagged |
 | `agentbacklog --done <ID> --agent-id <id>` | wip → done (archived) |
 | `agentbacklog --release <ID> --agent-id <id>` | wip → back to pending |
@@ -34,7 +34,7 @@ Features are enqueued, popped (FIFO, tunable via `--bump` priority and
 | `agentbacklog --verdict <ID> --reviewer <sid> --outcome approved\|denied\|conditional --comment "…"` | reviewing → wip; logs a review round |
 | `agentbacklog --reassign <ID> --agent-id <id>` | Re-owner a wip item (dead agent hand-off; `--force` covers review states) |
 | `agentbacklog --reviews <ID>` | Review history of an item |
-| `agentbacklog --edit <ID> [--title T] [--desc TXT|--desc-file F] [--append-desc TXT|--append-desc-file F] [--repo NAME] [--no-plan\|--plan]` | Update a pending item's fields (`--repo -` clears the tag; `--force` for other statuses) |
+| `agentbacklog --edit <ID> [--title T] [--desc TXT|--desc-file F] [--append-desc TXT|--append-desc-file F] [--repo NAME] [--no-plan\|--plan] [--agent P] [--model M] [--effort L] [--mode M] [--done-when C]` | Update a pending item's fields (`-` clears tag/dispatch fields; `--force` for other statuses) |
 | `agentbacklog --rm <ID>` | Delete an item (pending/done; `--force` for active states or to detach dependents) |
 | `agentbacklog --list [--all] [--repo NAME] [--json]` | List pending+wip (`--all` includes done) |
 
@@ -58,6 +58,10 @@ its plan (content is stored in the db, so any reviewer reads it via
 every round is logged (`--reviews ID`) and sends the item back to `wip`
 for implementation or revision (resubmit again after a
 conditional/denied). Items added with `--add --no-plan` skip the pipeline.
+
+Dispatch metadata (`agent`/`model`/`effort`/`mode`/`done_when` — read via
+`--list --json`) is an **orchestrator contract**: matching an item to an
+agent pool is the daemon's job, `--pop`/`--claim`/`--done` ignore it.
 
 ## Agent protocol
 
